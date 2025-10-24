@@ -16,6 +16,8 @@ import javax.net.ssl.KeyManagerFactory;     // Gestor de claves para TLS
 import javax.net.ssl.SSLContext;            // Contexto TLS
 import java.security.KeyStore;              // Almacén de claves
 import java.util.UUID;                      // Identificadores únicos para ficheros
+import java.util.HashMap;                   // Sesiones
+import java.util.Map;                       // Mapa
 
 /**
  * Servidor HTTP mínimo para gestionar registros de usuarios.
@@ -32,6 +34,13 @@ public class ServerMain {
     private static final int TLS_PORT = 8443;            // Puerto HTTPS
     private static final Path ROOT = Paths.get("server_users"); // Carpeta de almacenamiento
     private static final Path FILES = Paths.get("server_files");
+
+    // Sesiones simples en memoria (MVP): token -> (user, role)
+    private static final Map<String, Session> SESSIONS = new HashMap<>();
+    private static final class Session {
+        final String user; final String role;
+        Session(String u, String r){ this.user=u; this.role=r; }
+    }
 
     /** Starts the embedded HTTP server and registers routes. */
     public static void main(String[] args) throws Exception {
@@ -87,7 +96,8 @@ public class ServerMain {
                         + "\"saltB64\":\""+p.getProperty("saltB64")+"\","
                         + "\"publicKeyB64\":\""+p.getProperty("publicKeyB64")+"\","
                         + "\"encPrivateB64\":\""+p.getProperty("encPrivateB64")+"\","
-                        + "\"ivB64\":\""+p.getProperty("ivB64")+"\""
+                        + "\"ivB64\":\""+p.getProperty("ivB64")+"\","
+                        + "\"role\":\""+esc(p.getProperty("role","USER"))+"\""
                         + "}";
                 sendJson(exchange, 200, json);
             } catch (Exception e) { send(exchange, 500, e.toString()); }
@@ -100,9 +110,12 @@ public class ServerMain {
         // Recibe un JSON de fichero cifrado y guarda metadatos y ciphertext
         srv.createContext("/upload", exchange -> {
             try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
                 if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
                 String user = lastPathSegment(exchange.getRequestURI());
                 if (user == null) { send(exchange, 400, "missing user"); return; }
+                if (!"ADMIN".equals(sess.role) && !sess.user.equals(user)) { send(exchange, 403, "forbidden"); return; }
 
                 // Esperamos un cuerpo binario con un encabezado JSON mínimo en query?
                 // Para MVP: recibimos cuerpo como JSON texto: {filename, ivB64, cekWrappedB64, ctB64}
@@ -133,8 +146,11 @@ public class ServerMain {
         // Lista ficheros subidos (id + filename) para un usuario
         srv.createContext("/files", exchange -> {
             try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
                 String user = lastPathSegment(exchange.getRequestURI());
                 if (user == null) { send(exchange, 400, "missing user"); return; }
+                if (!"ADMIN".equals(sess.role) && !sess.user.equals(user)) { send(exchange, 403, "forbidden"); return; }
                 Path dir = FILES.resolve(user);
                 if (!Files.exists(dir)) { sendJson(exchange, 200, "[]"); return; }
                 StringBuilder sb = new StringBuilder("[");
@@ -159,8 +175,11 @@ public class ServerMain {
         // Lista ficheros que contienen wrap.<user> en cualquier owner
         srv.createContext("/files/shared", exchange -> {
             try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
                 String user = lastPathSegment(exchange.getRequestURI());
                 if (user == null) { send(exchange, 400, "missing user"); return; }
+                if (!"ADMIN".equals(sess.role) && !sess.user.equals(user)) { send(exchange, 403, "forbidden"); return; }
                 StringBuilder sb = new StringBuilder("[");
                 boolean first = true;
                 if (Files.exists(FILES)) {
@@ -187,6 +206,49 @@ public class ServerMain {
                 }
                 sb.append(']');
                 sendJson(exchange, 200, sb.toString());
+            } catch (Exception e) { send(exchange, 500, e.toString()); }
+        });
+
+        // --- Administración (solo ADMIN) ---
+        srv.createContext("/admin/users", exchange -> {
+            try {
+                Session sess = getSession(exchange);
+                if (sess == null || !"ADMIN".equals(sess.role)) { send(exchange, 403, "admin only"); return; }
+                if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use GET"); return; }
+                StringBuilder sb = new StringBuilder("[");
+                boolean first = true;
+                try (DirectoryStream<Path> ds = Files.newDirectoryStream(ROOT, "*.properties")) {
+                    for (Path f : ds) {
+                        Properties p = new Properties();
+                        try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                        if (!first) sb.append(','); first=false;
+                        sb.append('{')
+                          .append("\"username\":\"").append(esc(p.getProperty("username"))).append("\",")
+                          .append("\"role\":\"").append(esc(p.getProperty("role","USER").toUpperCase())).append("\"")
+                          .append('}');
+                    }
+                }
+                sb.append(']');
+                sendJson(exchange, 200, sb.toString());
+            } catch (Exception e) { send(exchange, 500, e.toString()); }
+        });
+
+        srv.createContext("/admin/setRole", exchange -> {
+            try {
+                Session sess = getSession(exchange);
+                if (sess == null || !"ADMIN".equals(sess.role)) { send(exchange, 403, "admin only"); return; }
+                if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
+                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                String user = jsonGet(body, "username");
+                String role = jsonGet(body, "role");
+                if (user==null || role==null) { send(exchange, 400, "missing fields"); return; }
+                Path f = ROOT.resolve(user + ".properties");
+                if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
+                Properties p = new Properties();
+                try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                p.setProperty("role", role.toUpperCase());
+                try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
+                send(exchange, 200, "ok");
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
 
@@ -239,13 +301,20 @@ public class ServerMain {
                 s.update(nonce);
                 boolean ok = s.verify(sig);
                 if (!ok) { send(exchange, 401, "bad signature"); return; }
-                sendJson(exchange, 200, "{\"ok\":true}");
+                String role = p.getProperty("role","USER").toUpperCase();
+                String token = java.util.UUID.randomUUID().toString().replace("-", "");
+                SESSIONS.put(token, new Session(user, role));
+                String out = "{"+
+                        "\"ok\":true,\"token\":\""+token+"\",\"role\":\""+role+"\",\"username\":\""+esc(user)+"\"}";
+                sendJson(exchange, 200, out);
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
 
         // Devuelve un fichero concreto en JSON (metadatos + ciphertext)
         srv.createContext("/file", exchange -> {
             try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
                 // Ruta esperada: /file/{user}/{id}
                 String path = exchange.getRequestURI().getPath();
                 String[] parts = path.split("/");
@@ -271,6 +340,9 @@ public class ServerMain {
 
                 Properties p = new Properties();
                 try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                boolean isOwner = user.equals(sess.user);
+                boolean isRecipient = p.getProperty("wrap."+sess.user) != null;
+                if (!"ADMIN".equals(sess.role) && !(isOwner || isRecipient)) { send(exchange, 403, "forbidden"); return; }
                 String cekWrap = recipient == null ? p.getProperty("cekWrappedB64") : p.getProperty("wrap."+recipient);
                 if (cekWrap == null) cekWrap = p.getProperty("cekWrappedB64");
                 String json = "{"+
@@ -287,6 +359,8 @@ public class ServerMain {
         // Añade un destinatario: envuelve CEK para user y guarda bajo wrap.<user>
         srv.createContext("/share", exchange -> {
             try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
                 if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
                 // Ruta: /share/{owner}/{id}
                 String path = exchange.getRequestURI().getPath();
@@ -294,6 +368,8 @@ public class ServerMain {
                 if (parts.length < 4) { send(exchange, 400, "missing owner or id"); return; }
                 String owner = parts[2];
                 String id = parts[3];
+                if (!"ADMIN".equals(sess.role) && !sess.user.equals(owner)) { send(exchange, 403, "forbidden"); return; }
+                if ("WORKER".equalsIgnoreCase(sess.role) || "AUDITOR".equalsIgnoreCase(sess.role)) { send(exchange, 403, "role cannot share"); return; }
                 Path f = FILES.resolve(owner).resolve(id+".properties");
                 if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
                 String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
@@ -391,6 +467,14 @@ public class ServerMain {
 
     /** Escapa comillas para embutir valores en JSON manual */
     private static String esc(String s){ return s==null? "": s.replace("\"","\\\""); }
+
+    /** Obtiene la sesión a partir del header Authorization: Bearer <token> */
+    private static Session getSession(HttpExchange ex) {
+        String h = ex.getRequestHeaders().getFirst("Authorization");
+        if (h == null || !h.startsWith("Bearer ")) return null;
+        String tok = h.substring(7);
+        return SESSIONS.get(tok);
+    }
 
     /**
      * Parser JSON muy sencillo: busca "key":"value" y extrae el valor.

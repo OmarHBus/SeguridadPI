@@ -136,8 +136,8 @@ public final class ServerStore {
         return resp; // JSON crudo con nonceB64, saltB64, publicKeyB64, encPrivateB64, ivB64
     }
 
-    /** Finaliza autenticación enviando firma del nonce. */
-    public static void authFinish(String username, String nonceB64, String signatureB64) throws IOException {
+    /** Finaliza autenticación: envía firma, recibe token y rol. */
+    public static String[] authFinish(String username, String nonceB64, String signatureB64) throws IOException {
         String json = "{"+
                 "\"username\":\""+esc(username)+"\","+
                 "\"nonceB64\":\""+nonceB64+"\","+
@@ -150,7 +150,11 @@ public final class ServerStore {
         c.setRequestProperty("Content-Type","application/json; charset=utf-8");
         try (OutputStream os = c.getOutputStream()) { os.write(body); }
         if (c.getResponseCode() != 200) { throw new IOException("server returned " + c.getResponseCode()); }
+        String resp = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         c.disconnect();
+        String token = jsonGet(resp, "token");
+        String role = jsonGet(resp, "role");
+        return new String[]{token, role};
     }
 
     /**
@@ -190,7 +194,7 @@ public final class ServerStore {
 
     // --- Files API (MVP) ---
     /** Sube el JSON de un fichero cifrado para un usuario. */
-    public static void uploadFile(String username, String filename, byte[] iv, byte[] cekWrapped, byte[] ciphertext) throws IOException {
+    public static void uploadFile(String username, String filename, byte[] iv, byte[] cekWrapped, byte[] ciphertext, String bearerToken) throws IOException {
         String json = "{"+
                 "\"filename\":\""+esc(filename)+"\","+
                 "\"ivB64\":\""+b64(iv)+"\","+
@@ -202,6 +206,7 @@ public final class ServerStore {
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type","application/json; charset=utf-8");
+        if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
         try (OutputStream os = c.getOutputStream()) { os.write(body); }
         int code = c.getResponseCode();
         if (code != 201) throw new IOException("server returned " + code);
@@ -209,9 +214,10 @@ public final class ServerStore {
     }
 
     /** Lista los ficheros del usuario y devuelve [id, filename]. */
-    public static String[][] listFiles(String username) throws IOException {
+    public static String[][] listFiles(String username, String bearerToken) throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/files/" + username).openConnection();
         c.setRequestMethod("GET");
+        if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
         String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         c.disconnect();
@@ -233,9 +239,10 @@ public final class ServerStore {
     }
 
     /** Lista ficheros compartidos conmigo: devuelve [owner, id, filename]. */
-    public static String[][] listShared(String username) throws IOException {
+    public static String[][] listShared(String username, String bearerToken) throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/files/shared/" + username).openConnection();
         c.setRequestMethod("GET");
+        if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
         String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         c.disconnect();
@@ -258,9 +265,10 @@ public final class ServerStore {
     }
 
     /** Descarga un fichero cifrado: GET /file/{user}/{id}. */
-    public static EncryptedFile downloadFile(String username, String id) throws IOException {
+    public static EncryptedFile downloadFile(String username, String id, String bearerToken) throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/file/" + username + "/" + id).openConnection();
         c.setRequestMethod("GET");
+        if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
         String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         c.disconnect();
@@ -273,9 +281,10 @@ public final class ServerStore {
     }
 
     /** Descarga un fichero cifrado especificando destinatario compartido. */
-    public static EncryptedFile downloadFileAs(String owner, String id, String recipient) throws IOException {
+    public static EncryptedFile downloadFileAs(String owner, String id, String recipient, String bearerToken) throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/file/" + owner + "/" + id + "/" + recipient).openConnection();
         c.setRequestMethod("GET");
+        if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
         String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         c.disconnect();
@@ -287,8 +296,46 @@ public final class ServerStore {
         return new EncryptedFile(fid, fname, iv, cekW, ct);
     }
 
+    // --- Admin API ---
+    /** Lista todos los usuarios (ADMIN). */
+    public static String[][] listAllUsers(String bearerToken) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/admin/users").openConnection();
+        c.setRequestMethod("GET");
+        if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
+        if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
+        String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        c.disconnect();
+        java.util.List<String[]> out = new java.util.ArrayList<>();
+        int i = 0;
+        while (true) {
+            int uIdx = json.indexOf("\"username\":\"", i); if (uIdx<0) break;
+            int uStart = uIdx+12; int uEnd = json.indexOf('"', uStart);
+            String username = json.substring(uStart, uEnd);
+            int rIdx = json.indexOf("\"role\":\"", uEnd); if (rIdx<0) break;
+            int rStart = rIdx+8; int rEnd = json.indexOf('"', rStart);
+            String role = json.substring(rStart, rEnd);
+            out.add(new String[]{username, role});
+            i = rEnd+1;
+        }
+        return out.toArray(new String[0][0]);
+    }
+
+    /** Cambia el rol de un usuario (ADMIN). */
+    public static void setUserRole(String username, String role, String bearerToken) throws IOException {
+        String json = "{"+"\"username\":\""+esc(username)+"\",\"role\":\""+esc(role)+"\"}";
+        byte[] body = json.getBytes(StandardCharsets.UTF_8);
+        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/admin/setRole").openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type","application/json; charset=utf-8");
+        if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
+        try (OutputStream os = c.getOutputStream()) { os.write(body); }
+        if (c.getResponseCode() != 200) { throw new IOException("server returned " + c.getResponseCode()); }
+        c.disconnect();
+    }
+
     /** Comparte un fichero con un usuario, enviando su CEK envuelta. */
-    public static void shareFile(String owner, String id, String targetUser, byte[] cekWrapped) throws IOException {
+    public static void shareFile(String owner, String id, String targetUser, byte[] cekWrapped, String bearerToken) throws IOException {
         String json = "{"+
                 "\"user\":\""+esc(targetUser)+"\","+
                 "\"cekWrappedB64\":\""+b64(cekWrapped)+"\""+
@@ -298,6 +345,7 @@ public final class ServerStore {
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type","application/json; charset=utf-8");
+        if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
         try (OutputStream os = c.getOutputStream()) { os.write(body); }
         if (c.getResponseCode() != 200) { throw new IOException("server returned " + c.getResponseCode()); }
         c.disconnect();

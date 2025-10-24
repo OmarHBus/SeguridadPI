@@ -32,6 +32,8 @@ public final class AuthApp extends JFrame {
     private String currentUsername = null;
     private PublicKey currentPublicKey = null;
     private PrivateKey currentPrivateKey = null;
+    private String currentRole = null;
+    private String bearerToken = null;
 
     public AuthApp() {
         super("Demo Registro / Login (PBKDF2 + RSA) – Cliente/Servidor");
@@ -44,6 +46,7 @@ public final class AuthApp extends JFrame {
         tabs.addTab("Iniciar sesión", buildLoginPanel());
         tabs.addTab("Ficheros", buildFilesPanel());
         tabs.addTab("Compartidos conmigo", buildSharedPanel());
+        tabs.addTab("Administración", buildAdminPanel());
         add(tabs);
     }
 
@@ -152,16 +155,18 @@ public final class AuthApp extends JFrame {
             s.update(nonce);
             String sigB64 = java.util.Base64.getEncoder().encodeToString(s.sign());
 
-            // Finalizar auth
-            ServerStore.authFinish(u, nonceB64, sigB64);
+            // Finalizar auth y recibir token/rol
+            String[] tk = ServerStore.authFinish(u, nonceB64, sigB64);
 
             // Guardar estado
             this.currentUsername = u;
             this.currentPublicKey = pub;
             this.currentPrivateKey = priv;
+            this.bearerToken = tk[0];
+            this.currentRole = tk[1];
 
             wipe(p);
-            msg("Login OK como '" + u + "'");
+            msg("Login OK como '" + u + "' (" + currentRole + ")");
             refreshFilesList();
         } catch (Exception ex) {
             wipe(p);
@@ -209,6 +214,9 @@ public final class AuthApp extends JFrame {
     private final DefaultListModel<String> sharedModel = new DefaultListModel<>();
     private final JList<String> sharedList = new JList<>(sharedModel);
     private final java.util.Map<String,String[]> sharedIdxToOwnerId = new java.util.LinkedHashMap<>(); // índice -> [owner,id]
+
+    private final DefaultListModel<String> usersModel = new DefaultListModel<>();
+    private final JList<String> usersList = new JList<>(usersModel);
     // Comentario de lo que hace el metodo buildFilesPanel:
     // Este método se encarga de construir el panel de archivos.
     // Primero crea un panel con un layout de borde (BorderLayout).
@@ -249,6 +257,21 @@ public final class AuthApp extends JFrame {
         p.add(new JScrollPane(sharedList), BorderLayout.CENTER);
         return p;
     }
+
+    /** Construye la pestaña de administración (solo ADMIN). */
+    private JPanel buildAdminPanel() {
+        JPanel p = new JPanel(new BorderLayout());
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JButton refresh = new JButton("Refrescar usuarios");
+        refresh.addActionListener(e -> refreshUsers());
+        JButton setRole = new JButton("Cambiar rol...");
+        setRole.addActionListener(e -> doChangeRole());
+        top.add(refresh);
+        top.add(setRole);
+        p.add(top, BorderLayout.NORTH);
+        p.add(new JScrollPane(usersList), BorderLayout.CENTER);
+        return p;
+    }
     // Comentario de lo que hace el metodo refreshFilesList:
     // Este método se encarga de actualizar la lista de archivos disponibles para el usuario.
     // Primero verifica si el usuario está autenticado.
@@ -262,9 +285,9 @@ public final class AuthApp extends JFrame {
             filesModel.clear();
             return;
         }
-        sessionLabel.setText(currentUsername);
+        sessionLabel.setText(currentUsername + (currentRole!=null? " ("+currentRole+")":""));
         try {
-            String[][] files = ServerStore.listFiles(currentUsername);
+            String[][] files = ServerStore.listFiles(currentUsername, bearerToken);
             filesModel.clear();
             idxToId.clear();
             for (int i=0;i<files.length;i++) {
@@ -275,13 +298,21 @@ public final class AuthApp extends JFrame {
             // refresh shared
             sharedModel.clear();
             sharedIdxToOwnerId.clear();
-            String[][] shared = ServerStore.listShared(currentUsername);
+            String[][] shared = ServerStore.listShared(currentUsername, bearerToken);
             for (int i=0;i<shared.length;i++) {
                 String owner = shared[i][0];
                 String id = shared[i][1];
                 String name = shared[i][2];
                 sharedModel.addElement(owner + " / " + name);
                 sharedIdxToOwnerId.put(String.valueOf(i), new String[]{owner, id});
+            }
+            // refresh admin users if ADMIN
+            usersModel.clear();
+            if ("ADMIN".equalsIgnoreCase(currentRole)) {
+                String[][] users = ServerStore.listAllUsers(bearerToken);
+                for (String[] u : users) {
+                    usersModel.addElement(u[0] + " (" + u[1] + ")");
+                }
             }
         } catch (Exception ex) {
             ex.printStackTrace();
@@ -310,7 +341,7 @@ public final class AuthApp extends JFrame {
             KeyService.EncryptedBytes enc = KeyService.encryptAesGcm(data, cek);
             // Envolver CEK para el propio usuario con su pública
             byte[] cekWrapped = KeyService.rsaOaepWrap(cek, currentPublicKey);
-            ServerStore.uploadFile(currentUsername, f.getName(), enc.iv, cekWrapped, enc.ciphertext);
+            ServerStore.uploadFile(currentUsername, f.getName(), enc.iv, cekWrapped, enc.ciphertext, bearerToken);
             msg("Fichero subido: " + f.getName());
             refreshFilesList();
         } catch (Exception ex) {
@@ -327,7 +358,7 @@ public final class AuthApp extends JFrame {
         String id = idxToId.get(String.valueOf(idx));
         if (id == null) { msg("No se pudo resolver el id del fichero"); return; }
         try {
-            ServerStore.EncryptedFile ef = ServerStore.downloadFile(currentUsername, id);
+            ServerStore.EncryptedFile ef = ServerStore.downloadFile(currentUsername, id, bearerToken);
             // Desenrollar CEK y descifrar
             byte[] cek = KeyService.rsaOaepUnwrap(ef.cekWrapped, currentPrivateKey);
             byte[] plain = KeyService.decryptAesGcm(new KeyService.EncryptedBytes(ef.iv, ef.ciphertext), cek);
@@ -353,7 +384,7 @@ public final class AuthApp extends JFrame {
         if (pair == null) { msg("No se pudo resolver el fichero"); return; }
         String owner = pair[0]; String id = pair[1];
         try {
-            ServerStore.EncryptedFile ef = ServerStore.downloadFileAs(owner, id, currentUsername);
+            ServerStore.EncryptedFile ef = ServerStore.downloadFileAs(owner, id, currentUsername, bearerToken);
             byte[] cek = KeyService.rsaOaepUnwrap(ef.cekWrapped, currentPrivateKey);
             byte[] plain = KeyService.decryptAesGcm(new KeyService.EncryptedBytes(ef.iv, ef.ciphertext), cek);
             JFileChooser ch = new JFileChooser();
@@ -379,18 +410,54 @@ public final class AuthApp extends JFrame {
         if (target == null || target.isBlank()) return;
         try {
             // Obtener el fichero cifrado como owner para recuperar CEK propia
-            ServerStore.EncryptedFile ef = ServerStore.downloadFile(currentUsername, id);
+            ServerStore.EncryptedFile ef = ServerStore.downloadFile(currentUsername, id, bearerToken);
             byte[] cek = KeyService.rsaOaepUnwrap(ef.cekWrapped, currentPrivateKey);
             // Cargar pública del destinatario (desde /user)
             var opt = ServerStore.load(target);
             if (opt.isEmpty()) { msg("El usuario destino no existe"); return; }
             var rec = opt.get();
             byte[] cekForTarget = KeyService.rsaOaepWrap(cek, rec.publicKey);
-            ServerStore.shareFile(currentUsername, id, target, cekForTarget);
+            if ("WORKER".equalsIgnoreCase(currentRole) || "AUDITOR".equalsIgnoreCase(currentRole)) {
+                msg("Tu rol no permite compartir");
+                return;
+            }
+            ServerStore.shareFile(currentUsername, id, target, cekForTarget, bearerToken);
             msg("Compartido con " + target);
         } catch (Exception ex) {
             ex.printStackTrace();
             msg("Error compartiendo: " + ex.getMessage());
+        }
+    }
+
+    /** Refresca la lista de usuarios (ADMIN). */
+    private void refreshUsers() {
+        if (!"ADMIN".equalsIgnoreCase(currentRole)) { msg("Solo ADMIN"); return; }
+        try {
+            usersModel.clear();
+            String[][] users = ServerStore.listAllUsers(bearerToken);
+            for (String[] u : users) usersModel.addElement(u[0] + " (" + u[1] + ")");
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            msg("Error listando usuarios: " + ex.getMessage());
+        }
+    }
+
+    /** Cambia el rol de un usuario seleccionado (ADMIN). */
+    private void doChangeRole() {
+        if (!"ADMIN".equalsIgnoreCase(currentRole)) { msg("Solo ADMIN"); return; }
+        int idx = usersList.getSelectedIndex(); if (idx<0) { msg("Selecciona un usuario"); return; }
+        String entry = usersModel.get(idx); // formato: username (ROLE)
+        String username = entry.substring(0, entry.indexOf(' ')).trim();
+        String newRole = (String) JOptionPane.showInputDialog(this, "Nuevo rol:", "Cambiar rol",
+                JOptionPane.PLAIN_MESSAGE, null, new String[]{"ADMIN","USER","WORKER","AUDITOR"}, "USER");
+        if (newRole == null) return;
+        try {
+            ServerStore.setUserRole(username, newRole, bearerToken);
+            refreshUsers();
+            msg("Rol actualizado");
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            msg("Error cambiando rol: " + ex.getMessage());
         }
     }
 }
