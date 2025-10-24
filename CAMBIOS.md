@@ -97,25 +97,25 @@ La UI deshabilita “Compartir” en WORKER y AUDITOR; el servidor valida igualm
 
 #### Cómo ejecutar (Windows / PowerShell)
 
-1) Compilar:
+Compilar:
 
 ``` java
 javac -encoding UTF-8 -d bin -cp src src\AuthApp.java src\KeyService.java src\PasswordHasher.java src\ServerMain.java src\ServerStore.java
 ```
 
-1) Arrancar servidor:
+Arrancar servidor:
 
 ``` java
 java -cp bin ServerMain
 ```
 
-1) Arrancar cliente:
+Arrancar cliente:
 
 ``` java
 java -cp bin AuthApp
 ```
 
-1) TLS (opcional): generar keystore (contraseña `changeit` por defecto en este MVP)
+TLS (opcional): generar keystore (contraseña `changeit` por defecto en este MVP)
 
 ``` java
 keytool -genkeypair -alias server -keyalg RSA -keysize 2048 -storetype PKCS12 \
