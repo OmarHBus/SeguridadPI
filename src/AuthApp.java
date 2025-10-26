@@ -38,7 +38,7 @@ public final class AuthApp extends JFrame {
     public AuthApp() {
         super("Demo Registro / Login (PBKDF2 + RSA) – Cliente/Servidor");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setSize(460, 280);
+        setSize(700, 450);
         setLocationRelativeTo(null); // Centra la ventana
 
         JTabbedPane tabs = new JTabbedPane();

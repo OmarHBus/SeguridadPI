@@ -16,6 +16,7 @@
 import java.io.*;                        // Entrada y salida de datos (InputStream, OutputStream, IOException)
 import java.net.HttpURLConnection;       // Clase para conexiones HTTP cliente-servidor
 import java.net.URL;                     // Representa una dirección web (ej: http://localhost:8080)
+import java.net.URI;                     // Representa un URI inmutable y seguro
 import java.nio.charset.StandardCharsets; // Define codificación UTF-8 para texto
 import java.security.KeyFactory;         // Permite reconstruir claves RSA desde sus bytes
 import java.security.PublicKey;          // Representa una clave pública RSA
@@ -73,7 +74,7 @@ public final class ServerStore {
      */
     /** Comprueba si existe un usuario mediante GET /exists/{username}. */
     public static boolean exists(String username) throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/exists/" + username).openConnection();
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/exists/" + username).toURL().openConnection();
         c.setRequestMethod("GET");
         int code = c.getResponseCode();
         c.disconnect();
@@ -88,7 +89,7 @@ public final class ServerStore {
     public static Optional<UserRecord> load(String username) {
         try {
             // Crear la conexión HTTP
-            HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/user/" + username).openConnection();
+            HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/user/" + username).toURL().openConnection();
             c.setRequestMethod("GET");
             
             // Si no existe el usuario, devolver vacío
@@ -125,7 +126,7 @@ public final class ServerStore {
     public static String authStart(String username) throws IOException {
         String json = "{\"username\":\""+esc(username)+"\"}";
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
-        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/auth/start").openConnection();
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/auth/start").toURL().openConnection();
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type","application/json; charset=utf-8");
@@ -144,7 +145,7 @@ public final class ServerStore {
                 "\"signatureB64\":\""+signatureB64+"\""+
                 "}";
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
-        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/auth/finish").openConnection();
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/auth/finish").toURL().openConnection();
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type","application/json; charset=utf-8");
@@ -176,7 +177,7 @@ public final class ServerStore {
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
 
         // Crear la conexión HTTP tipo POST
-        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/register").openConnection();
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/register").toURL().openConnection();
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type","application/json; charset=utf-8");
@@ -202,7 +203,7 @@ public final class ServerStore {
                 "\"ctB64\":\""+b64(ciphertext)+"\""+
                 "}";
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
-        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/upload/" + username).openConnection();
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/upload/" + username).toURL().openConnection();
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type","application/json; charset=utf-8");
@@ -215,7 +216,7 @@ public final class ServerStore {
 
     /** Lista los ficheros del usuario y devuelve [id, filename]. */
     public static String[][] listFiles(String username, String bearerToken) throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/files/" + username).openConnection();
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/files/" + username).toURL().openConnection();
         c.setRequestMethod("GET");
         if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
@@ -240,7 +241,7 @@ public final class ServerStore {
 
     /** Lista ficheros compartidos conmigo: devuelve [owner, id, filename]. */
     public static String[][] listShared(String username, String bearerToken) throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/files/shared/" + username).openConnection();
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/files/shared/" + username).toURL().openConnection();
         c.setRequestMethod("GET");
         if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
@@ -266,7 +267,7 @@ public final class ServerStore {
 
     /** Descarga un fichero cifrado: GET /file/{user}/{id}. */
     public static EncryptedFile downloadFile(String username, String id, String bearerToken) throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/file/" + username + "/" + id).openConnection();
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/file/" + username + "/" + id).toURL().openConnection();
         c.setRequestMethod("GET");
         if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
@@ -282,7 +283,7 @@ public final class ServerStore {
 
     /** Descarga un fichero cifrado especificando destinatario compartido. */
     public static EncryptedFile downloadFileAs(String owner, String id, String recipient, String bearerToken) throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/file/" + owner + "/" + id + "/" + recipient).openConnection();
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/file/" + owner + "/" + id + "/" + recipient).toURL().openConnection();
         c.setRequestMethod("GET");
         if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
@@ -299,7 +300,7 @@ public final class ServerStore {
     // --- Admin API ---
     /** Lista todos los usuarios (ADMIN). */
     public static String[][] listAllUsers(String bearerToken) throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/admin/users").openConnection();
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/admin/users").toURL().openConnection();
         c.setRequestMethod("GET");
         if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
@@ -324,7 +325,7 @@ public final class ServerStore {
     public static void setUserRole(String username, String role, String bearerToken) throws IOException {
         String json = "{"+"\"username\":\""+esc(username)+"\",\"role\":\""+esc(role)+"\"}";
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
-        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/admin/setRole").openConnection();
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/admin/setRole").toURL().openConnection();
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type","application/json; charset=utf-8");
@@ -341,7 +342,7 @@ public final class ServerStore {
                 "\"cekWrappedB64\":\""+b64(cekWrapped)+"\""+
                 "}";
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
-        HttpURLConnection c = (HttpURLConnection) new URL(BASE + "/share/" + owner + "/" + id).openConnection();
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/share/" + owner + "/" + id).toURL().openConnection();
         c.setRequestMethod("POST");
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type","application/json; charset=utf-8");
