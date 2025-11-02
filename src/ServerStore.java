@@ -37,6 +37,7 @@ public final class ServerStore {
     // Dirección base del servidor HTTP
     private static final String BASE = "https://localhost:8443";
     private static final boolean DEV_TRUST_ALL = true; // Solo para entorno de desarrollo
+    private static final int LARGE_JSON_STRING = 4_194_304; // 4 MiB for Base64 payloads
 
     static {
         // Activa confianza amplia para el certificado de desarrollo (self-signed)
@@ -133,9 +134,11 @@ public final class ServerStore {
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type","application/json; charset=utf-8");
         try (OutputStream os = c.getOutputStream()) { os.write(body); }
-        if (c.getResponseCode() != 200) { throw new IOException("server returned " + c.getResponseCode()); }
-        String resp = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        int code = c.getResponseCode();
+        InputStream stream = code >= 200 && code < 300 ? c.getInputStream() : c.getErrorStream();
+        String resp = stream != null ? new String(stream.readAllBytes(), StandardCharsets.UTF_8) : "";
         c.disconnect();
+        if (code != 200) { throw new IOException(buildErrorMessage(code, resp)); }
         return resp; // JSON crudo con nonceB64, saltB64, publicKeyB64, encPrivateB64, ivB64
     }
 
@@ -152,9 +155,11 @@ public final class ServerStore {
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type","application/json; charset=utf-8");
         try (OutputStream os = c.getOutputStream()) { os.write(body); }
-        if (c.getResponseCode() != 200) { throw new IOException("server returned " + c.getResponseCode()); }
-        String resp = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        int code = c.getResponseCode();
+        InputStream stream = code >= 200 && code < 300 ? c.getInputStream() : c.getErrorStream();
+        String resp = stream != null ? new String(stream.readAllBytes(), StandardCharsets.UTF_8) : "";
         c.disconnect();
+        if (code != 200) { throw new IOException(buildErrorMessage(code, resp)); }
         Map<String, String> data = JsonUtil.parseObject(resp, 8, 1024);
         String token = require(data, "token");
         String role = require(data, "role");
@@ -262,7 +267,7 @@ public final class ServerStore {
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
         String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         c.disconnect();
-        Map<String, String> data = JsonUtil.parseObject(json, 16, 4096);
+        Map<String, String> data = JsonUtil.parseObject(json, 16, LARGE_JSON_STRING);
         String fid = require(data, "id");
         String fname = require(data, "filename");
         byte[] iv = b64d(require(data, "ivB64"));
@@ -279,7 +284,7 @@ public final class ServerStore {
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
         String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         c.disconnect();
-        Map<String, String> data = JsonUtil.parseObject(json, 16, 4096);
+        Map<String, String> data = JsonUtil.parseObject(json, 16, LARGE_JSON_STRING);
         String fid = require(data, "id");
         String fname = require(data, "filename");
         byte[] iv = b64d(require(data, "ivB64"));
@@ -360,6 +365,19 @@ public final class ServerStore {
     /** Decodifica texto Base64 a bytes */
     private static byte[] b64d(String s) {
         return Base64.getDecoder().decode(s);
+    }
+
+    private static String buildErrorMessage(int code, String body) {
+        if (code == 401) {
+            return "Sesión expirada o token inválido";
+        }
+        if (code == 423) {
+            return body == null || body.isBlank() ? "Cuenta bloqueada temporalmente" : body.trim();
+        }
+        if (body == null || body.isBlank()) {
+            return "server returned " + code;
+        }
+        return "server returned " + code + " - " + body.trim();
     }
 
     /** Configura HTTPS para confiar en cualquier certificado (solo DEV). */

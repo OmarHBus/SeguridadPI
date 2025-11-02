@@ -1,6 +1,7 @@
 // Librerías de interfaz gráfica (Swing y AWT)
 import javax.swing.*;  // Proporciona los componentes de la interfaz gráfica: JFrame, JButton, JTextField, etc.
 import java.awt.*;     // Contiene clases para el diseño visual y manejo de gráficos (layouts, colores, fuentes, etc.)
+import java.io.IOException;                // Manejo de errores de red
 
 // Librerías de criptografía y gestión de claves
 import java.security.KeyFactory;           // Permite reconstruir objetos de tipo Key (PrivateKey, PublicKey) a partir de su representación codificada
@@ -175,6 +176,9 @@ public final class AuthApp extends JFrame {
             wipe(p);
             msg("Login OK como '" + u + "' (" + currentRole + ")");
             refreshFilesList();
+        } catch (IOException io) {
+            wipe(p);
+            msg("Error en login: " + io.getMessage());
         } catch (Exception ex) {
             wipe(p);
             ex.printStackTrace();
