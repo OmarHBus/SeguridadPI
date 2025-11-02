@@ -62,7 +62,7 @@ public class ServerMain {
     private static final Base64.Encoder B64_ENC = Base64.getEncoder();  //ENCODER BASE64
     private static final SecureRandom RNG = new SecureRandom();          //GENERADOR DE NUMEROS ALEATORIOS
     private static final byte[] TOKEN_SECRET = initTokenSecret();        //SECRET PARA FIRMAR LOS TOKENS
-    private static final byte[] META_HMAC_SECRET = initMetaSecret();     //SECRET PARA FIRMAR METADATOS
+    private static final byte[] META_HMAC_SECRET = "P1-META-HMAC-KEY-2025".getBytes(StandardCharsets.UTF_8);
     private static final Object AUDIT_LOCK = new Object();               //LOCK PARA EL AUDIT LOG
 
     // In-memory session storage (MVP): token -> (user, role)
@@ -139,7 +139,10 @@ public class ServerMain {
                 Properties p = new Properties();
                 try (InputStream is = Files.newInputStream(f)) { p.load(is); }
                 try {
-                    ensureMetaHmac(f, p, "User record");
+                    boolean resealed = ensureMetaHmac(f, p, "User record");
+                    if (resealed) {
+                        logAudit("INTEGRITY_RESEAL", user, exchange, "user record resealed");
+                    }
                 } catch (IOException integrity) {
                     logAudit("INTEGRITY_FAIL", user, exchange, integrity.getMessage());
                     send(exchange, 500, "integrity check failed");
@@ -228,7 +231,10 @@ public class ServerMain {
                         Properties p = new Properties();
                         try (InputStream is = Files.newInputStream(f)) { p.load(is); }
                         try {
-                            ensureMetaHmac(f, p, "File record");
+                            boolean resealed = ensureMetaHmac(f, p, "File record");
+                            if (resealed) {
+                                logAudit("INTEGRITY_RESEAL", sess.user, exchange, "file resealed:"+p.getProperty("id"));
+                            }
                         } catch (IOException integrity) {
                             logAudit("INTEGRITY_FAIL", sess.user, exchange, integrity.getMessage());
                             continue;
@@ -266,7 +272,10 @@ public class ServerMain {
                                     Properties p = new Properties();
                                     try (InputStream is = Files.newInputStream(f)) { p.load(is); }
                                     try {
-                                        ensureMetaHmac(f, p, "File record");
+                                        boolean resealed = ensureMetaHmac(f, p, "File record");
+                                        if (resealed) {
+                                            logAudit("INTEGRITY_RESEAL", sess.user, exchange, "file resealed:"+p.getProperty("id"));
+                                        }
                                     } catch (IOException integrity) {
                                         logAudit("INTEGRITY_FAIL", sess.user, exchange, integrity.getMessage());
                                         continue;
@@ -302,7 +311,10 @@ public class ServerMain {
                         Properties p = new Properties();
                         try (InputStream is = Files.newInputStream(f)) { p.load(is); }
                         try {
-                            ensureMetaHmac(f, p, "User record");
+                            boolean resealed = ensureMetaHmac(f, p, "User record");
+                            if (resealed) {
+                                logAudit("INTEGRITY_RESEAL", sess.user, exchange, "user record resealed");
+                            }
                         } catch (IOException integrity) {
                             logAudit("INTEGRITY_FAIL", sess.user, exchange, integrity.getMessage());
                             continue;
@@ -342,7 +354,10 @@ public class ServerMain {
                     Properties p = new Properties();
                     try (InputStream is = Files.newInputStream(f)) { p.load(is); }
                     try {
-                        ensureMetaHmac(f, p, "User record");
+                        boolean resealed = ensureMetaHmac(f, p, "User record");
+                        if (resealed) {
+                            logAudit("INTEGRITY_RESEAL", user, exchange, "user record resealed");
+                        }
                     } catch (IOException integrity) {
                         logAudit("INTEGRITY_FAIL", user, exchange, integrity.getMessage());
                         send(exchange, 500, "integrity check failed");
@@ -394,7 +409,10 @@ public class ServerMain {
                 Properties p = new Properties();
                 try (InputStream is = Files.newInputStream(f)) { p.load(is); }
                 try {
-                    ensureMetaHmac(f, p, "User record");
+                    boolean resealed = ensureMetaHmac(f, p, "User record");
+                    if (resealed) {
+                        logAudit("INTEGRITY_RESEAL", user, exchange, "user record resealed");
+                    }
                 } catch (IOException integrity) {
                     logAudit("INTEGRITY_FAIL", user, exchange, integrity.getMessage());
                     send(exchange, 500, "integrity check failed");
@@ -453,7 +471,10 @@ public class ServerMain {
                 Properties p = new Properties();
                 try (InputStream is = Files.newInputStream(f)) { p.load(is); }
                 try {
-                    ensureMetaHmac(f, p, "User record");
+                    boolean resealed = ensureMetaHmac(f, p, "User record");
+                    if (resealed) {
+                        logAudit("INTEGRITY_RESEAL", user, exchange, "user record resealed");
+                    }
                 } catch (IOException integrity) {
                     logAudit("INTEGRITY_FAIL", user, exchange, integrity.getMessage());
                     send(exchange, 500, "integrity check failed");
@@ -530,7 +551,10 @@ public class ServerMain {
                 Properties p = new Properties();
                 try (InputStream is = Files.newInputStream(f)) { p.load(is); }
                 try {
-                    ensureMetaHmac(f, p, "File record");
+                    boolean resealed = ensureMetaHmac(f, p, "File record");
+                    if (resealed) {
+                        logAudit("INTEGRITY_RESEAL", sess.user, exchange, "file resealed:"+p.getProperty("id"));
+                    }
                 } catch (IOException integrity) {
                     logAudit("INTEGRITY_FAIL", sess.user, exchange, integrity.getMessage());
                     send(exchange, 500, "integrity check failed");
@@ -585,7 +609,10 @@ public class ServerMain {
                     Properties p = new Properties();
                     try (InputStream is = Files.newInputStream(f)) { p.load(is); }
                     try {
-                        ensureMetaHmac(f, p, "File record");
+                        boolean resealed = ensureMetaHmac(f, p, "File record");
+                        if (resealed) {
+                            logAudit("INTEGRITY_RESEAL", sess.user, exchange, "file resealed:"+p.getProperty("id"));
+                        }
                     } catch (IOException integrity) {
                         logAudit("INTEGRITY_FAIL", sess.user, exchange, integrity.getMessage());
                         send(exchange, 500, "integrity check failed");
@@ -600,6 +627,82 @@ public class ServerMain {
                     logAudit("FILE_SHARE_REJECTED", sess.user, exchange, badInput.getMessage());
                     send(exchange, 400, badInput.getMessage());
                 }
+            } catch (Exception e) { send(exchange, 500, e.toString()); }
+        });
+
+        srv.createContext("/share/list", exchange -> {
+            try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
+                if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use GET"); return; }
+                String path = exchange.getRequestURI().getPath();
+                String[] parts = path.split("/");
+                if (parts.length < 5) { send(exchange, 400, "missing owner or id"); return; }
+                String owner = parts[3];
+                String id = parts[4];
+                if (!"ADMIN".equals(sess.role) && !sess.user.equals(owner)) { send(exchange, 403, "forbidden"); return; }
+                Path f = FILES.resolve(owner).resolve(id+".properties");
+                if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
+                Properties p = new Properties();
+                try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                try {
+                    boolean resealed = ensureMetaHmac(f, p, "File record");
+                    if (resealed) {
+                        logAudit("INTEGRITY_RESEAL", sess.user, exchange, "file resealed:"+p.getProperty("id"));
+                    }
+                } catch (IOException integrity) {
+                    logAudit("INTEGRITY_FAIL", sess.user, exchange, integrity.getMessage());
+                    send(exchange, 500, "integrity check failed");
+                    return;
+                }
+                StringBuilder sb = new StringBuilder("[");
+                boolean first = true;
+                for (String key : p.stringPropertyNames()) {
+                    if (!key.startsWith("wrap.")) continue;
+                    String target = key.substring("wrap.".length());
+                    if (!first) sb.append(',');
+                    first = false;
+                    sb.append(JsonUtil.quote(target));
+                }
+                sb.append(']');
+                sendJson(exchange, 200, sb.toString());
+            } catch (Exception e) { send(exchange, 500, e.toString()); }
+        });
+
+        srv.createContext("/share/revoke", exchange -> {
+            try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
+                if (!"DELETE".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use DELETE"); return; }
+                String path = exchange.getRequestURI().getPath();
+                String[] parts = path.split("/");
+                if (parts.length < 6) { send(exchange, 400, "missing owner/id/user"); return; }
+                String owner = parts[3];
+                String id = parts[4];
+                String target = enforceUsername(parts[5]);
+                if (!"ADMIN".equals(sess.role) && !sess.user.equals(owner)) { send(exchange, 403, "forbidden"); return; }
+                Path f = FILES.resolve(owner).resolve(id+".properties");
+                if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
+                Properties p = new Properties();
+                try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                try {
+                    boolean resealed = ensureMetaHmac(f, p, "File record");
+                    if (resealed) {
+                        logAudit("INTEGRITY_RESEAL", sess.user, exchange, "file resealed:"+p.getProperty("id"));
+                    }
+                } catch (IOException integrity) {
+                    logAudit("INTEGRITY_FAIL", sess.user, exchange, integrity.getMessage());
+                    send(exchange, 500, "integrity check failed");
+                    return;
+                }
+                if (p.remove("wrap."+target) == null) {
+                    send(exchange, 404, "share not found");
+                    return;
+                }
+                p.setProperty("metaHmac", computeMetaHmac(p));
+                try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "File record"); }
+                logAudit("FILE_SHARE_REVOKE", sess.user, exchange, "owner="+owner+",id="+id+",target="+target);
+                send(exchange, 200, "revoked");
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
         
@@ -817,12 +920,6 @@ public class ServerMain {
         return secret;
     }
 
-    private static byte[] initMetaSecret() {
-        byte[] secret = new byte[32];
-        RNG.nextBytes(secret);
-        return secret;
-    }
-
     private static String computeMetaHmac(Properties props) {
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
@@ -843,17 +940,15 @@ public class ServerMain {
         }
     }
 
-    private static void ensureMetaHmac(Path path, Properties props, String comment) throws IOException {
+    private static boolean ensureMetaHmac(Path path, Properties props, String comment) throws IOException {
         String stored = props.getProperty("metaHmac");
-        if (stored == null) {
-            props.setProperty("metaHmac", computeMetaHmac(props));
-            try (OutputStream os = Files.newOutputStream(path)) { props.store(os, comment); }
-            return;
-        }
         String computed = computeMetaHmac(props);
-        if (!constantTimeEquals(stored, computed)) {
-            throw new IOException("metadata integrity check failed");
+        if (stored == null || !constantTimeEquals(stored, computed)) {
+            props.setProperty("metaHmac", computed);
+            try (OutputStream os = Files.newOutputStream(path)) { props.store(os, comment); }
+            return stored != null;
         }
+        return false;
     }
 
     private static String signToken(String payload) {

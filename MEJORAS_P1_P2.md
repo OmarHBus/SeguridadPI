@@ -29,10 +29,22 @@
 
 ## Cambios aplicados
 - Cada registro `.properties` (usuarios y ficheros) se firma con HMAC-SHA256 (`metaHmac`); al leerlos se valida y, si falta la firma por ser legacy, se regenera automáticamente.
-- Las operaciones sensibles (`/user`, `/auth/*`, `/files`, `/file`, `/share`, `/admin/*`) abortan con error y registran `INTEGRITY_FAIL` si la comprobación no cuadra.
+- Las operaciones sensibles (`/user`, `/auth/*`, `/files`, `/file`, `/share`, `/admin/*`) abortan con error y registran `INTEGRITY_FAIL` si la comprobación no cuadra. Por ejemplo cambiar manualmente un .properties e intentar realizar una acción, fallará
 - La compartición y los cambios de rol recalculan la firma inmediatamente tras modificar metadatos, evitando que queden registros inconsistentes.
 
 ## Impacto en el proyecto
 - Protege contra manipulación accidental o maliciosa de los almacenes planos, requisito clave antes de pasar a un almacenamiento más sofisticado en la fase 2.
 - Facilita la detección temprana de corrupción en ficheros cifrados: cualquier descarga que no pase la verificación se rechaza sin exponer datos.
 - Deja la puerta lista para añadir etiquetas adicionales (versión, timestamp firmado) o migrar a un backend autenticado sin perder compatibilidad con los datos existentes.
+
+# Bloque 4 · Gestión de comparticiones
+
+## Cambios aplicados
+- Nuevos endpoints (`/share/list`, `/share/revoke`) permiten al propietario o a un admin listar destinatarios y revocar accesos sin tocar manualmente los `.properties`.
+- Cada revocación elimina `wrap.usuario`, recalcula el `metaHmac` del fichero y registra `FILE_SHARE_REVOKE` en el audit log.
+- El cliente incorpora un botón “Revocar” que muestra los destinatarios actuales y envía la orden al servidor.
+
+## Impacto en el proyecto
+- Se facilita la higiene de comparticiones, evitando mantener accesos residuales tras cambios de rol o bajas.
+- La auditoría captura tanto las concesiones como las revocaciones, útil para trazabilidad y futuras políticas de cumplimiento.
+- Sienta las bases para añadir caducidad automática o rotación de CEK en la fase 2, sin romper los flujos existentes.

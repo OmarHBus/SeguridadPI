@@ -249,9 +249,12 @@ public final class AuthApp extends JFrame {
         download.addActionListener(e -> doDownloadSelected());
         JButton share = new JButton("Compartir");
         share.addActionListener(e -> doShareSelected());
+        JButton revoke = new JButton("Revocar");
+        revoke.addActionListener(e -> doRevokeSelected());
         top.add(upload);
         top.add(download);
         top.add(share);
+        top.add(revoke);
         p.add(top, BorderLayout.NORTH);
 
         p.add(new JScrollPane(filesList), BorderLayout.CENTER);
@@ -440,6 +443,29 @@ public final class AuthApp extends JFrame {
         } catch (Exception ex) {
             ex.printStackTrace();
             msg("Error compartiendo: " + ex.getMessage());
+        }
+    }
+
+    private void doRevokeSelected() {
+        if (currentUsername == null || currentPrivateKey == null) { msg("Inicia sesión primero"); return; }
+        int idx = filesList.getSelectedIndex();
+        if (idx < 0) { msg("Selecciona un fichero"); return; }
+        String id = idxToId.get(String.valueOf(idx));
+        if (id == null) { msg("No se pudo resolver el id del fichero"); return; }
+        try {
+            String[] recipients = ServerStore.listShareRecipients(currentUsername, id, bearerToken);
+            if (recipients.length == 0) {
+                msg("El fichero no tiene destinatarios activos");
+                return;
+            }
+            String target = (String) JOptionPane.showInputDialog(this, "Revocar usuario:", "Revocar compartición",
+                    JOptionPane.PLAIN_MESSAGE, null, recipients, recipients[0]);
+            if (target == null) return;
+            ServerStore.revokeShare(currentUsername, id, target, bearerToken);
+            msg("Acceso revocado para " + target);
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            msg("Error revocando: " + ex.getMessage());
         }
     }
 

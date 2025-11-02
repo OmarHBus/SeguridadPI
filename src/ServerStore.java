@@ -343,6 +343,32 @@ public final class ServerStore {
         c.disconnect();
     }
 
+    /** Lista los destinatarios actuales de un fichero compartido. */
+    public static String[] listShareRecipients(String owner, String id, String bearerToken) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/share/list/" + owner + "/" + id).toURL().openConnection();
+        c.setRequestMethod("GET");
+        if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
+        int code = c.getResponseCode();
+        InputStream stream = code >= 200 && code < 300 ? c.getInputStream() : c.getErrorStream();
+        String json = stream != null ? new String(stream.readAllBytes(), StandardCharsets.UTF_8) : "";
+        c.disconnect();
+        if (code != 200) { throw new IOException(buildErrorMessage(code, json)); }
+        List<String> list = JsonUtil.parseArrayOfStrings(json, 1024, 256);
+        return list.toArray(new String[0]);
+    }
+
+    /** Revoca el acceso previamente compartido a un usuario. */
+    public static void revokeShare(String owner, String id, String targetUser, String bearerToken) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/share/revoke/" + owner + "/" + id + "/" + targetUser).toURL().openConnection();
+        c.setRequestMethod("DELETE");
+        if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
+        int code = c.getResponseCode();
+        InputStream stream = code >= 200 && code < 300 ? c.getInputStream() : c.getErrorStream();
+        String body = stream != null ? new String(stream.readAllBytes(), StandardCharsets.UTF_8) : "";
+        c.disconnect();
+        if (code != 200) { throw new IOException(buildErrorMessage(code, body)); }
+    }
+
     // --- Métodos auxiliares de codificación/decodificación ---
 
     private static String require(Map<String, String> map, String key) {

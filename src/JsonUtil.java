@@ -36,6 +36,13 @@ public final class JsonUtil {
         return list;
     }
 
+    public static List<String> parseArrayOfStrings(String json, int maxItems, int maxStringLength) {
+        Parser parser = new Parser(json, maxStringLength);
+        List<String> list = parser.readArrayOfStrings(maxItems);
+        parser.ensureEof();
+        return list;
+    }
+
     public static String escape(String value) {
         if (value == null) return "";
         StringBuilder sb = new StringBuilder(value.length() + 16);
@@ -150,6 +157,34 @@ public final class JsonUtil {
                 }
                 Map<String, String> obj = readObject(maxEntriesPerItem);
                 list.add(obj);
+                skipWs();
+                if (peek(']')) {
+                    pos++;
+                    break;
+                }
+                expect(',');
+                skipWs();
+            }
+            return list;
+        }
+
+        private List<String> readArrayOfStrings(int maxItems) {
+            skipWs();
+            expect('[');
+            List<String> list = new ArrayList<>();
+            skipWs();
+            if (peek(']')) {
+                pos++;
+                return list;
+            }
+            int items = 0;
+            while (true) {
+                items++;
+                if (items > maxItems) {
+                    throw new IllegalArgumentException("JSON array exceeds maximum length");
+                }
+                String value = readString();
+                list.add(value);
                 skipWs();
                 if (peek(']')) {
                     pos++;
