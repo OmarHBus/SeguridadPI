@@ -1,23 +1,27 @@
-// === Librerías del servidor HTTP embebido de Java (sin dependencias externas) ===
-import com.sun.net.httpserver.HttpExchange; // Representa una petición/respuesta HTTP
-import com.sun.net.httpserver.HttpHandler;  // Interfaz para manejar endpoints
-import com.sun.net.httpserver.HttpServer;   // Servidor HTTP ligero embebido
-import com.sun.net.httpserver.HttpsConfigurator; // Configurador HTTPS
-import com.sun.net.httpserver.HttpsServer;  // Servidor HTTPS
+// === Embedded HTTP server utilities (no external dependencies) ===
+import com.sun.net.httpserver.HttpExchange; // Represents an HTTP request/response pair
+import com.sun.net.httpserver.HttpHandler;  // Interface used to handle endpoints
+import com.sun.net.httpserver.HttpServer;   // Lightweight embedded HTTP server
+import com.sun.net.httpserver.HttpsConfigurator; // HTTPS configurator helper
+import com.sun.net.httpserver.HttpsServer;  // HTTPS server variant
 
-// === E/S y utilidades de sistema de ficheros ===
-import java.io.*;                           // InputStream/OutputStream, IOException
-import java.net.InetSocketAddress;          // Dirección/puerto para el servidor
-import java.net.URI;                        // Para inspeccionar rutas
-import java.nio.charset.StandardCharsets;   // Codificación UTF-8 estable
-import java.nio.file.*;                     // Paths, Files… para leer/escribir .properties
-import java.util.Properties;                // Formato .properties simple (clave=valor)
-import javax.net.ssl.KeyManagerFactory;     // Gestor de claves para TLS
-import javax.net.ssl.SSLContext;            // Contexto TLS
-import java.security.KeyStore;              // Almacén de claves
-import java.util.UUID;                      // Identificadores únicos para ficheros
-import java.util.HashMap;                   // Sesiones
-import java.util.Map;                       // Mapa
+// === I/O and filesystem helpers ===
+import java.io.*;                           // Streams, readers, writers, IOExceptions
+import java.net.InetSocketAddress;          // Address/port binding
+import java.net.URI;                        // URI inspection helpers
+import java.nio.charset.StandardCharsets;   // Stable UTF-8 charset
+import java.nio.file.*;                     // Paths, Files for reading/writing .properties
+import java.util.Properties;                // Simple key=value storage (.properties)
+import javax.net.ssl.KeyManagerFactory;     // TLS keystore manager
+import javax.net.ssl.SSLContext;            // TLS context setup
+import java.security.KeyStore;              // Keystore abstraction
+import java.util.UUID;                      // Unique identifiers for files
+import java.util.Base64;                    // Base64 sanitation helpers
+import java.util.HashMap;                   // Session storage
+import java.util.Map;                       // Generic map
+import java.util.List;                      // JSON array handling
+import java.util.Set;                       // Allowed roles
+import java.util.regex.Pattern;             // Input validation patterns
 
 /**
  * Servidor HTTP mínimo para gestionar registros de usuarios.
@@ -35,7 +39,18 @@ public class ServerMain {
     private static final Path ROOT = Paths.get("server_users"); // Carpeta de almacenamiento
     private static final Path FILES = Paths.get("server_files");
 
-    // Sesiones simples en memoria (MVP): token -> (user, role)
+    private static final int MAX_REGISTER_BODY = 8_192;
+    private static final int MAX_GENERIC_BODY = 32_768;
+    private static final int MAX_UPLOAD_BODY = 12_582_912; // ~9.4 MiB decoded -> 12.6 MiB Base64
+    private static final int MAX_FILE_DECODED_BYTES = 9_437_184; // Approximately 9 MiB decoded payload per encrypted file
+    private static final Pattern USERNAME_PATTERN = Pattern.compile("^[a-zA-Z0-9_.-]{3,32}$");
+    private static final int MAX_FILENAME_LENGTH = 255;
+    private static final Set<String> ALLOWED_ROLES = Set.of("ADMIN", "USER", "WORKER", "AUDITOR");
+
+    private static final Base64.Decoder B64_DEC = Base64.getDecoder();
+    private static final Base64.Encoder B64_ENC = Base64.getEncoder();
+
+    // In-memory session storage (MVP): token -> (user, role)
     private static final Map<String, Session> SESSIONS = new HashMap<>();
     private static final class Session {
         final String user; final String role;
@@ -91,14 +106,14 @@ public class ServerMain {
                 try (InputStream is = Files.newInputStream(f)) { p.load(is); }
 
                 // Construcción manual de JSON (simple, sin librerías)
-                String json = "{"
-                        + "\"username\":\""+esc(p.getProperty("username"))+"\","
-                        + "\"saltB64\":\""+p.getProperty("saltB64")+"\","
-                        + "\"publicKeyB64\":\""+p.getProperty("publicKeyB64")+"\","
-                        + "\"encPrivateB64\":\""+p.getProperty("encPrivateB64")+"\","
-                        + "\"ivB64\":\""+p.getProperty("ivB64")+"\","
-                        + "\"role\":\""+esc(p.getProperty("role","USER"))+"\""
-                        + "}";
+                String json = "{"+
+                        "\"username\":"+JsonUtil.quote(p.getProperty("username"))+","+
+                        "\"saltB64\":"+JsonUtil.quote(p.getProperty("saltB64"))+","+
+                        "\"publicKeyB64\":"+JsonUtil.quote(p.getProperty("publicKeyB64"))+","+
+                        "\"encPrivateB64\":"+JsonUtil.quote(p.getProperty("encPrivateB64"))+","+
+                        "\"ivB64\":"+JsonUtil.quote(p.getProperty("ivB64"))+","+
+                        "\"role\":"+JsonUtil.quote(p.getProperty("role","USER"))
+                        +"}";
                 sendJson(exchange, 200, json);
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
@@ -117,29 +132,38 @@ public class ServerMain {
                 if (user == null) { send(exchange, 400, "missing user"); return; }
                 if (!"ADMIN".equals(sess.role) && !sess.user.equals(user)) { send(exchange, 403, "forbidden"); return; }
 
-                // Esperamos un cuerpo binario con un encabezado JSON mínimo en query?
-                // Para MVP: recibimos cuerpo como JSON texto: {filename, ivB64, cekWrappedB64, ctB64}
-                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-                String filename = jsonGet(body, "filename");
-                String ivB64    = jsonGet(body, "ivB64");
-                String cekWrapB64 = jsonGet(body, "cekWrappedB64");
-                String ctB64    = jsonGet(body, "ctB64");
-                if (filename==null || ivB64==null || cekWrapB64==null || ctB64==null) { send(exchange, 400, "missing fields"); return; }
+                String body;
+                try {
+                    body = readBody(exchange, MAX_UPLOAD_BODY);
+                } catch (IllegalArgumentException tooBig) {
+                    send(exchange, 413, "body too large");
+                    return;
+                }
 
-                String id = UUID.randomUUID().toString().replace("-", "");
-                Path dir = FILES.resolve(user);
-                Files.createDirectories(dir);
+                try {
+                    Map<String, String> data = JsonUtil.parseObject(body, 16, 4096);
+                    String filename = enforceFilename(require(data, "filename"));
+                    String ivB64 = canonicalBase64("ivB64", require(data, "ivB64"), 12, 48);
+                    String cekWrapB64 = canonicalBase64("cekWrappedB64", require(data, "cekWrappedB64"), 32, 1024);
+                    String ctB64 = canonicalBase64("ctB64", require(data, "ctB64"), 0, MAX_FILE_DECODED_BYTES);
 
-                Properties p = new Properties();
-                p.setProperty("id", id);
-                p.setProperty("owner", user);
-                p.setProperty("filename", filename);
-                p.setProperty("ivB64", ivB64);
-                p.setProperty("cekWrappedB64", cekWrapB64);
-                p.setProperty("ctB64", ctB64);
+                    String id = UUID.randomUUID().toString().replace("-", "");
+                    Path dir = FILES.resolve(user);
+                    Files.createDirectories(dir);
 
-                try (OutputStream os = Files.newOutputStream(dir.resolve(id+".properties"))) { p.store(os, "File record"); }
-                sendJson(exchange, 201, "{\"fileId\":\""+id+"\"}");
+                    Properties p = new Properties();
+                    p.setProperty("id", id);
+                    p.setProperty("owner", user);
+                    p.setProperty("filename", filename);
+                    p.setProperty("ivB64", ivB64);
+                    p.setProperty("cekWrappedB64", cekWrapB64);
+                    p.setProperty("ctB64", ctB64);
+
+                    try (OutputStream os = Files.newOutputStream(dir.resolve(id+".properties"))) { p.store(os, "File record"); }
+                    sendJson(exchange, 201, "{\"fileId\":"+JsonUtil.quote(id)+"}");
+                } catch (IllegalArgumentException badInput) {
+                    send(exchange, 400, badInput.getMessage());
+                }
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
 
@@ -162,8 +186,8 @@ public class ServerMain {
                         if (!first) sb.append(',');
                         first = false;
                         sb.append('{')
-                          .append("\"id\":\"").append(esc(p.getProperty("id"))).append("\",")
-                          .append("\"filename\":\"").append(esc(p.getProperty("filename"))).append("\"")
+                          .append("\"id\":").append(JsonUtil.quote(p.getProperty("id"))).append(',')
+                          .append("\"filename\":").append(JsonUtil.quote(p.getProperty("filename")))
                           .append('}');
                     }
                 }
@@ -195,9 +219,9 @@ public class ServerMain {
                                     if (wrap == null) continue;
                                     if (!first) sb.append(','); first = false;
                                     sb.append('{')
-                                      .append("\"owner\":\"").append(esc(owner)).append("\",")
-                                      .append("\"id\":\"").append(esc(p.getProperty("id"))).append("\",")
-                                      .append("\"filename\":\"").append(esc(p.getProperty("filename"))).append("\"")
+                                      .append("\"owner\":").append(JsonUtil.quote(owner)).append(',')
+                                      .append("\"id\":").append(JsonUtil.quote(p.getProperty("id"))).append(',')
+                                      .append("\"filename\":").append(JsonUtil.quote(p.getProperty("filename")))
                                       .append('}');
                                 }
                             }
@@ -223,8 +247,8 @@ public class ServerMain {
                         try (InputStream is = Files.newInputStream(f)) { p.load(is); }
                         if (!first) sb.append(','); first=false;
                         sb.append('{')
-                          .append("\"username\":\"").append(esc(p.getProperty("username"))).append("\",")
-                          .append("\"role\":\"").append(esc(p.getProperty("role","USER").toUpperCase())).append("\"")
+                          .append("\"username\":").append(JsonUtil.quote(p.getProperty("username"))).append(',')
+                          .append("\"role\":").append(JsonUtil.quote(p.getProperty("role","USER").toUpperCase()))
                           .append('}');
                     }
                 }
@@ -238,17 +262,29 @@ public class ServerMain {
                 Session sess = getSession(exchange);
                 if (sess == null || !"ADMIN".equals(sess.role)) { send(exchange, 403, "admin only"); return; }
                 if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
-                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-                String user = jsonGet(body, "username");
-                String role = jsonGet(body, "role");
-                if (user==null || role==null) { send(exchange, 400, "missing fields"); return; }
-                Path f = ROOT.resolve(user + ".properties");
-                if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
-                Properties p = new Properties();
-                try (InputStream is = Files.newInputStream(f)) { p.load(is); }
-                p.setProperty("role", role.toUpperCase());
-                try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
-                send(exchange, 200, "ok");
+
+                String body;
+                try {
+                    body = readBody(exchange, MAX_GENERIC_BODY);
+                } catch (IllegalArgumentException tooBig) {
+                    send(exchange, 413, "body too large");
+                    return;
+                }
+
+                try {
+                    Map<String, String> data = JsonUtil.parseObject(body, 6, 512);
+                    String user = enforceUsername(require(data, "username"));
+                    String role = enforceRole(require(data, "role"));
+                    Path f = ROOT.resolve(user + ".properties");
+                    if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
+                    Properties p = new Properties();
+                    try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                    p.setProperty("role", role);
+                    try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
+                    send(exchange, 200, "ok");
+                } catch (IllegalArgumentException badInput) {
+                    send(exchange, 400, badInput.getMessage());
+                }
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
 
@@ -256,23 +292,38 @@ public class ServerMain {
         srv.createContext("/auth/start", exchange -> {
             try {
                 if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
-                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-                String user = jsonGet(body, "username");
-                if (user == null) { send(exchange, 400, "missing username"); return; }
+
+                String body;
+                try {
+                    body = readBody(exchange, MAX_GENERIC_BODY);
+                } catch (IllegalArgumentException tooBig) {
+                    send(exchange, 413, "body too large");
+                    return;
+                }
+
+                String user;
+                try {
+                    Map<String, String> data = JsonUtil.parseObject(body, 4, 256);
+                    user = enforceUsername(require(data, "username"));
+                } catch (IllegalArgumentException badInput) {
+                    send(exchange, 400, badInput.getMessage());
+                    return;
+                }
+
                 Path f = ROOT.resolve(user + ".properties");
                 if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
                 Properties p = new Properties();
                 try (InputStream is = Files.newInputStream(f)) { p.load(is); }
-                // Generar nonce aleatorio
                 byte[] nonce = new byte[32]; new java.security.SecureRandom().nextBytes(nonce);
+                String nonceB64 = B64_ENC.encodeToString(nonce);
                 String json = "{"+
-                        "\"nonceB64\":\""+java.util.Base64.getEncoder().encodeToString(nonce)+"\","+
-                        "\"saltB64\":\""+p.getProperty("saltB64")+"\","+
-                        "\"publicKeyB64\":\""+p.getProperty("publicKeyB64")+"\","+
-                        "\"encPrivateB64\":\""+p.getProperty("encPrivateB64")+"\","+
-                        "\"ivB64\":\""+p.getProperty("ivB64")+"\""+
-                        "}";
-                exchange.getResponseHeaders().add("X-Auth-Nonce", java.util.Base64.getEncoder().encodeToString(nonce));
+                        "\"nonceB64\":"+JsonUtil.quote(nonceB64)+","+
+                        "\"saltB64\":"+JsonUtil.quote(p.getProperty("saltB64"))+","+
+                        "\"publicKeyB64\":"+JsonUtil.quote(p.getProperty("publicKeyB64"))+","+
+                        "\"encPrivateB64\":"+JsonUtil.quote(p.getProperty("encPrivateB64"))+","+
+                        "\"ivB64\":"+JsonUtil.quote(p.getProperty("ivB64"))
+                        +"}";
+                exchange.getResponseHeaders().add("X-Auth-Nonce", nonceB64);
                 sendJson(exchange, 200, json);
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
@@ -280,20 +331,35 @@ public class ServerMain {
         srv.createContext("/auth/finish", exchange -> {
             try {
                 if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
-                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-                String user = jsonGet(body, "username");
-                String nonceB64 = jsonGet(body, "nonceB64");
-                String sigB64 = jsonGet(body, "signatureB64");
-                if (user==null || nonceB64==null || sigB64==null) { send(exchange, 400, "missing fields"); return; }
+
+                String body;
+                try {
+                    body = readBody(exchange, MAX_GENERIC_BODY);
+                } catch (IllegalArgumentException tooBig) {
+                    send(exchange, 413, "body too large");
+                    return;
+                }
+
+                String user;
+                byte[] nonce;
+                byte[] sig;
+                try {
+                    Map<String, String> data = JsonUtil.parseObject(body, 8, 2048);
+                    user = enforceUsername(require(data, "username"));
+                    nonce = decodeBase64("nonceB64", require(data, "nonceB64"), 16, 128);
+                    sig = decodeBase64("signatureB64", require(data, "signatureB64"), 64, 4096);
+                } catch (IllegalArgumentException badInput) {
+                    send(exchange, 400, badInput.getMessage());
+                    return;
+                }
+
                 Path f = ROOT.resolve(user + ".properties");
                 if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
                 Properties p = new Properties();
                 try (InputStream is = Files.newInputStream(f)) { p.load(is); }
-                byte[] pub = java.util.Base64.getDecoder().decode(p.getProperty("publicKeyB64"));
+                byte[] pubBytes = decodeBase64("publicKeyB64", p.getProperty("publicKeyB64"), 256, 4096);
                 java.security.PublicKey pk = java.security.KeyFactory.getInstance("RSA")
-                        .generatePublic(new java.security.spec.X509EncodedKeySpec(pub));
-                byte[] nonce = java.util.Base64.getDecoder().decode(nonceB64);
-                byte[] sig = java.util.Base64.getDecoder().decode(sigB64);
+                        .generatePublic(new java.security.spec.X509EncodedKeySpec(pubBytes));
                 java.security.Signature s = java.security.Signature.getInstance("RSASSA-PSS");
                 s.setParameter(new java.security.spec.PSSParameterSpec(
                         "SHA-256", "MGF1", new java.security.spec.MGF1ParameterSpec("SHA-256"), 32, 1));
@@ -305,7 +371,11 @@ public class ServerMain {
                 String token = java.util.UUID.randomUUID().toString().replace("-", "");
                 SESSIONS.put(token, new Session(user, role));
                 String out = "{"+
-                        "\"ok\":true,\"token\":\""+token+"\",\"role\":\""+role+"\",\"username\":\""+esc(user)+"\"}";
+                        "\"ok\":true,"+
+                        "\"token\":"+JsonUtil.quote(token)+","+
+                        "\"role\":"+JsonUtil.quote(role)+","+
+                        "\"username\":"+JsonUtil.quote(user)
+                        +"}";
                 sendJson(exchange, 200, out);
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
@@ -346,12 +416,12 @@ public class ServerMain {
                 String cekWrap = recipient == null ? p.getProperty("cekWrappedB64") : p.getProperty("wrap."+recipient);
                 if (cekWrap == null) cekWrap = p.getProperty("cekWrappedB64");
                 String json = "{"+
-                        "\"id\":\""+esc(p.getProperty("id"))+"\","+
-                        "\"filename\":\""+esc(p.getProperty("filename"))+"\","+
-                        "\"ivB64\":\""+p.getProperty("ivB64")+"\","+
-                        "\"cekWrappedB64\":\""+cekWrap+"\","+
-                        "\"ctB64\":\""+p.getProperty("ctB64")+"\""+
-                        "}";
+                        "\"id\":"+JsonUtil.quote(p.getProperty("id"))+","+
+                        "\"filename\":"+JsonUtil.quote(p.getProperty("filename"))+","+
+                        "\"ivB64\":"+JsonUtil.quote(p.getProperty("ivB64"))+","+
+                        "\"cekWrappedB64\":"+JsonUtil.quote(cekWrap)+","+
+                        "\"ctB64\":"+JsonUtil.quote(p.getProperty("ctB64"))
+                        +"}";
                 sendJson(exchange, 200, json);
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
@@ -372,15 +442,27 @@ public class ServerMain {
                 if ("WORKER".equalsIgnoreCase(sess.role) || "AUDITOR".equalsIgnoreCase(sess.role)) { send(exchange, 403, "role cannot share"); return; }
                 Path f = FILES.resolve(owner).resolve(id+".properties");
                 if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
-                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-                String target = jsonGet(body, "user");
-                String cekWrapB64 = jsonGet(body, "cekWrappedB64");
-                if (target==null || cekWrapB64==null) { send(exchange, 400, "missing fields"); return; }
-                Properties p = new Properties();
-                try (InputStream is = Files.newInputStream(f)) { p.load(is); }
-                p.setProperty("wrap."+target, cekWrapB64);
-                try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "File record"); }
-                send(exchange, 200, "shared");
+
+                String body;
+                try {
+                    body = readBody(exchange, MAX_GENERIC_BODY);
+                } catch (IllegalArgumentException tooBig) {
+                    send(exchange, 413, "body too large");
+                    return;
+                }
+
+                try {
+                    Map<String, String> data = JsonUtil.parseObject(body, 8, 2048);
+                    String target = enforceUsername(require(data, "user"));
+                    String cekWrapB64 = canonicalBase64("cekWrappedB64", require(data, "cekWrappedB64"), 32, 1024);
+                    Properties p = new Properties();
+                    try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                    p.setProperty("wrap."+target, cekWrapB64);
+                    try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "File record"); }
+                    send(exchange, 200, "shared");
+                } catch (IllegalArgumentException badInput) {
+                    send(exchange, 400, badInput.getMessage());
+                }
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
         
@@ -404,39 +486,35 @@ public class ServerMain {
     // --- Handler dedicado para /register (POST) ---
     static class RegisterHandler implements HttpHandler {
         @Override public void handle(HttpExchange exchange) throws IOException {
-            // Solo acepta POST
+            // Only accept POST
             if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
                 send(exchange, 405, "use POST"); return;
             }
-            // Lee el cuerpo de la petición (JSON plano UTF-8)
-            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            try {
+                String body = readBody(exchange, MAX_REGISTER_BODY);
+                Map<String, String> data = JsonUtil.parseObject(body, 12, 2048);
 
-            // Extrae campos "clave":"valor" (parser naive)
-            String user = jsonGet(body, "username");
-            String saltB64 = jsonGet(body, "saltB64");
-            String pubB64  = jsonGet(body, "publicKeyB64");
-            String encPriv = jsonGet(body, "encPrivateB64");
-            String ivB64   = jsonGet(body, "ivB64");
+                String user = enforceUsername(require(data, "username"));
+                String saltB64 = canonicalBase64("saltB64", require(data, "saltB64"), 16, 32);
+                String pubB64 = canonicalBase64("publicKeyB64", require(data, "publicKeyB64"), 256, 4096);
+                String encPriv = canonicalBase64("encPrivateB64", require(data, "encPrivateB64"), 256, 6144);
+                String ivB64 = canonicalBase64("ivB64", require(data, "ivB64"), 12, 48);
 
-            // Validación de campos requeridos (ya no se acepta dkB64)
-            if (user==null || saltB64==null || pubB64==null || encPriv==null || ivB64==null) {
-                send(exchange, 400, "missing fields"); return;
+                Path f = ROOT.resolve(user + ".properties");
+                if (Files.exists(f)) { send(exchange, 409, "user exists"); return; }
+
+                Properties p = new Properties();
+                p.setProperty("username", user);
+                p.setProperty("saltB64", saltB64);
+                p.setProperty("publicKeyB64", pubB64);
+                p.setProperty("encPrivateB64", encPriv);
+                p.setProperty("ivB64", ivB64);
+
+                try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
+                send(exchange, 201, "created");
+            } catch (IllegalArgumentException e) {
+                send(exchange, 400, e.getMessage());
             }
-
-            // Evita sobreescritura: 409 si ya existe
-            Path f = ROOT.resolve(user + ".properties");
-            if (Files.exists(f)) { send(exchange, 409, "user exists"); return; }
-
-            // Guarda el registro como .properties
-            Properties p = new Properties();
-            p.setProperty("username", user);
-            p.setProperty("saltB64", saltB64);
-            p.setProperty("publicKeyB64", pubB64);
-            p.setProperty("encPrivateB64", encPriv);
-            p.setProperty("ivB64", ivB64);
-
-            try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
-            send(exchange, 201, "created");
         }
     }
 
@@ -449,7 +527,7 @@ public class ServerMain {
         return (i>=0 && i+1<p.length()) ? p.substring(i+1) : null;
     }
 
-    /** Respuesta de texto plano con código HTTP */
+    /** Sends plain text responses with the desired HTTP status code. */
     private static void send(HttpExchange ex, int code, String txt) throws IOException {
         byte[] out = txt.getBytes(StandardCharsets.UTF_8);
         ex.getResponseHeaders().add("Content-Type","text/plain; charset=utf-8");
@@ -457,7 +535,7 @@ public class ServerMain {
         try (OutputStream os = ex.getResponseBody()) { os.write(out); }
     }
 
-    /** Respuesta JSON con código HTTP */
+    /** Sends JSON responses with the desired HTTP status code. */
     private static void sendJson(HttpExchange ex, int code, String json) throws IOException {
         byte[] out = json.getBytes(StandardCharsets.UTF_8);
         ex.getResponseHeaders().add("Content-Type","application/json; charset=utf-8");
@@ -468,7 +546,7 @@ public class ServerMain {
     /** Escapa comillas para embutir valores en JSON manual */
     private static String esc(String s){ return s==null? "": s.replace("\"","\\\""); }
 
-    /** Obtiene la sesión a partir del header Authorization: Bearer <token> */
+    /** Resolves the bearer token from the Authorization header. */
     private static Session getSession(HttpExchange ex) {
         String h = ex.getRequestHeaders().getFirst("Authorization");
         if (h == null || !h.startsWith("Bearer ")) return null;
@@ -476,17 +554,98 @@ public class ServerMain {
         return SESSIONS.get(tok);
     }
 
-    /**
-     * Parser JSON muy sencillo: busca "key":"value" y extrae el valor.
-     * (Válido para esta práctica; no soporta anidados ni arrays)
-     */
-    private static String jsonGet(String json, String key) {
-        String pat = "\"" + key + "\":\"";
-        int i = json.indexOf(pat);
-        if (i<0) return null;
-        int start = i + pat.length();
-        int end = json.indexOf('"', start);
-        if (end<0) return null;
-        return json.substring(start, end);
+    /** Reads the request body enforcing an upper bound in bytes. */
+    private static String readBody(HttpExchange exchange, int maxBytes) throws IOException {
+        try (InputStream in = exchange.getRequestBody(); ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+            byte[] buf = new byte[4096];
+            int total = 0;
+            int read;
+            while ((read = in.read(buf)) != -1) {
+                total += read;
+                if (total > maxBytes) {
+                    throw new IllegalArgumentException("body too large");
+                }
+                baos.write(buf, 0, read);
+            }
+            return baos.toString(StandardCharsets.UTF_8);
+        }
+    }
+
+    /** Returns a trimmed field from the parsed JSON map or fails fast. */
+    private static String require(Map<String, String> data, String key) {
+        String value = data.get(key);
+        if (value == null) {
+            throw new IllegalArgumentException("missing field: " + key);
+        }
+        String trimmed = value.trim();
+        if (trimmed.isEmpty()) {
+            throw new IllegalArgumentException("empty field: " + key);
+        }
+        return trimmed;
+    }
+
+    /** Validates usernames against the server policy. */
+    private static String enforceUsername(String raw) {
+        String candidate = raw.trim();
+        if (!USERNAME_PATTERN.matcher(candidate).matches()) {
+            throw new IllegalArgumentException("invalid username");
+        }
+        return candidate;
+    }
+
+    /** Ensures filenames remain within allowed characters and length. */
+    private static String enforceFilename(String raw) {
+        String name = raw.trim();
+        if (name.isEmpty()) {
+            throw new IllegalArgumentException("invalid filename");
+        }
+        if (name.length() > MAX_FILENAME_LENGTH) {
+            throw new IllegalArgumentException("filename too long");
+        }
+        if (name.contains("/") || name.contains("\\") || name.contains("..")) {
+            throw new IllegalArgumentException("invalid filename");
+        }
+        for (int i = 0; i < name.length(); i++) {
+            char ch = name.charAt(i);
+            if (ch < 0x20) {
+                throw new IllegalArgumentException("invalid filename");
+            }
+        }
+        return name;
+    }
+
+    /** Canonicalises a Base64 field after validating its decoded size. */
+    private static String canonicalBase64(String field, String value, int minBytes, int maxBytes) {
+        byte[] decoded = decodeBase64(field, value, minBytes, maxBytes);
+        return B64_ENC.encodeToString(decoded);
+    }
+
+    /** Decodes Base64 data enforcing size constraints. */
+    private static byte[] decodeBase64(String field, String value, int minBytes, int maxBytes) {
+        String sanitized = value.trim();
+        if (sanitized.isEmpty() && minBytes > 0) {
+            throw new IllegalArgumentException("missing field: " + field);
+        }
+        try {
+            byte[] out = B64_DEC.decode(sanitized);
+            if (out.length < minBytes) {
+                throw new IllegalArgumentException(field + " too short");
+            }
+            if (out.length > maxBytes) {
+                throw new IllegalArgumentException(field + " too large");
+            }
+            return out;
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("invalid base64: " + field);
+        }
+    }
+
+    /** Normalises and validates roles allowed in the system. */
+    private static String enforceRole(String raw) {
+        String role = raw.trim().toUpperCase();
+        if (!ALLOWED_ROLES.contains(role)) {
+            throw new IllegalArgumentException("invalid role");
+        }
+        return role;
     }
 }

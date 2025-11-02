@@ -8,6 +8,8 @@ import java.security.KeyPair;              // Representa un par de claves (una p
 import java.security.PrivateKey;           // Clase que define una clave privada (para descifrar o firmar)
 import java.security.PublicKey;            // Clase que define una clave pública (para cifrar o verificar firmas)
 import java.security.spec.PKCS8EncodedKeySpec; // Especifica el formato estandarizado PKCS#8 para representar una clave privada codificada en bytes
+import java.util.Map;                      // JSON key/value handling on the client
+import java.util.regex.Pattern;            // Username validation pattern
 
 /**
  * Interfaz gráfica de autenticación y registro.
@@ -19,6 +21,8 @@ import java.security.spec.PKCS8EncodedKeySpec; // Especifica el formato estandar
  *  - AES-GCM para proteger la clave privada con una clave derivada.
  */
 public final class AuthApp extends JFrame {
+
+    private static final Pattern USERNAME_PATTERN = Pattern.compile("^[a-zA-Z0-9_.-]{3,32}$");
 
     // Campos de registro
     private final JTextField regUser = new JTextField(18);
@@ -98,6 +102,7 @@ public final class AuthApp extends JFrame {
         char[] p = regPass.getPassword();
 
         if (u.isEmpty() || p.length==0) { msg("Rellena usuario y contraseña"); wipe(p); return; }
+        if (!isValidUsername(u)) { msg("El usuario debe tener 3-32 caracteres y solo puede contener letras, números, punto, guion y guion bajo"); wipe(p); return; }
 
         try {
             // 0) Comprobar en servidor si existe
@@ -132,11 +137,13 @@ public final class AuthApp extends JFrame {
         char[] p = logPass.getPassword();
 
         if (u.isEmpty() || p.length==0) { msg("Rellena usuario y contraseña"); wipe(p); return; }
+        if (!isValidUsername(u)) { msg("El usuario debe tener 3-32 caracteres y solo puede contener letras, números, punto, guion y guion bajo"); wipe(p); return; }
 
         try {
             // 0) Iniciar auth: obtener nonce. Para claves/salt usa /user (parser ya probado)
             String start = ServerStore.authStart(u);
-            String nonceB64 = extract(start, "nonceB64");
+            Map<String, String> startData = JsonUtil.parseObject(start, 12, 4096);
+            String nonceB64 = requireField(startData, "nonceB64");
             var recOpt = ServerStore.load(u);
             if (recOpt.isEmpty()) { msg("Usuario no existe en servidor"); wipe(p); return; }
             var rec = recOpt.get();
@@ -175,20 +182,21 @@ public final class AuthApp extends JFrame {
         }
     }
 
-    /** Extrae un valor de JSON plano "key":"value". */
-    private static String extract(String json, String key) {
-        String pat = "\""+key+"\":\"";
-        int i = json.indexOf(pat);
-        if (i<0) return null;
-        int s = i + pat.length();
-        int e = json.indexOf('"', s);
-        if (e<0) return null;
-        return json.substring(s, e);
-    }
-
     /** Reconstruye una PrivateKey RSA desde bytes PKCS#8. */
     private static PrivateKey buildPrivateFromPkcs8(byte[] pkcs8) throws Exception {
         return KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(pkcs8));
+    }
+
+    private static boolean isValidUsername(String username) {
+        return username != null && USERNAME_PATTERN.matcher(username).matches();
+    }
+
+    private static String requireField(Map<String, String> json, String key) {
+        String value = json.get(key);
+        if (value == null) throw new IllegalArgumentException("Falta el campo " + key);
+        String trimmed = value.trim();
+        if (trimmed.isEmpty()) throw new IllegalArgumentException("Campo vacío: " + key);
+        return trimmed;
     }
 
     /** Muestra un diálogo modal con un mensaje. */
@@ -408,6 +416,8 @@ public final class AuthApp extends JFrame {
         if (id == null) { msg("No se pudo resolver el id del fichero"); return; }
         String target = JOptionPane.showInputDialog(this, "Usuario destino:");
         if (target == null || target.isBlank()) return;
+        target = target.trim();
+        if (!isValidUsername(target)) { msg("Usuario destino inválido"); return; }
         try {
             // Obtener el fichero cifrado como owner para recuperar CEK propia
             ServerStore.EncryptedFile ef = ServerStore.downloadFile(currentUsername, id, bearerToken);

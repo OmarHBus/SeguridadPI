@@ -23,6 +23,8 @@ import java.security.PublicKey;          // Representa una clave pública RSA
 import java.security.spec.X509EncodedKeySpec; // Define el formato X.509 estándar para claves públicas
 import java.util.Base64;                 // Codificación y decodificación Base64
 import java.util.Optional;               // Maneja valores opcionales sin usar null
+import java.util.Map;                    // Representaciones JSON clave-valor
+import java.util.List;                   // Arrays JSON de objetos
 import javax.net.ssl.HttpsURLConnection; // Conexiones HTTPS
 import javax.net.ssl.SSLContext;         // Contexto TLS para confiar en dev
 import javax.net.ssl.TrustManager;       // Gestor de confianza
@@ -102,12 +104,12 @@ public final class ServerStore {
             String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
             c.disconnect();
 
-            // Extraer campos del JSON manualmente (sin librerías externas)
-            String u   = jsonGet(json, "username");
-            byte[] salt= b64d(jsonGet(json, "saltB64"));
-            byte[] pub = b64d(jsonGet(json, "publicKeyB64"));
-            byte[] enc = b64d(jsonGet(json, "encPrivateB64"));
-            byte[] iv  = b64d(jsonGet(json, "ivB64"));
+            Map<String, String> data = JsonUtil.parseObject(json, 16, 4096);
+            String u   = require(data, "username");
+            byte[] salt= b64d(require(data, "saltB64"));
+            byte[] pub = b64d(require(data, "publicKeyB64"));
+            byte[] enc = b64d(require(data, "encPrivateB64"));
+            byte[] iv  = b64d(require(data, "ivB64"));
             
             // Reconstruir la clave pública RSA desde formato X.509
             PublicKey pk = KeyFactory.getInstance("RSA").generatePublic(new X509EncodedKeySpec(pub));
@@ -124,7 +126,7 @@ public final class ServerStore {
     // --- Auth (challenge) ---
     /** Inicia autenticación: devuelve nonce y materiales para abrir la privada. */
     public static String authStart(String username) throws IOException {
-        String json = "{\"username\":\""+esc(username)+"\"}";
+        String json = "{"+"\"username\":"+JsonUtil.quote(username)+"}";
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
         HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/auth/start").toURL().openConnection();
         c.setRequestMethod("POST");
@@ -140,10 +142,10 @@ public final class ServerStore {
     /** Finaliza autenticación: envía firma, recibe token y rol. */
     public static String[] authFinish(String username, String nonceB64, String signatureB64) throws IOException {
         String json = "{"+
-                "\"username\":\""+esc(username)+"\","+
-                "\"nonceB64\":\""+nonceB64+"\","+
-                "\"signatureB64\":\""+signatureB64+"\""+
-                "}";
+                "\"username\":"+JsonUtil.quote(username)+","+
+                "\"nonceB64\":"+JsonUtil.quote(nonceB64)+","+
+                "\"signatureB64\":"+JsonUtil.quote(signatureB64)
+                +"}";
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
         HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/auth/finish").toURL().openConnection();
         c.setRequestMethod("POST");
@@ -153,8 +155,9 @@ public final class ServerStore {
         if (c.getResponseCode() != 200) { throw new IOException("server returned " + c.getResponseCode()); }
         String resp = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         c.disconnect();
-        String token = jsonGet(resp, "token");
-        String role = jsonGet(resp, "role");
+        Map<String, String> data = JsonUtil.parseObject(resp, 8, 1024);
+        String token = require(data, "token");
+        String role = require(data, "role");
         return new String[]{token, role};
     }
 
@@ -167,12 +170,12 @@ public final class ServerStore {
 
         // Construir JSON con los campos del usuario
         String json = "{"+
-                "\"username\":\""+esc(ur.username)+"\","+
-                "\"saltB64\":\""+b64(ur.salt)+"\","+
-                "\"publicKeyB64\":\""+b64(ur.publicKey.getEncoded())+"\","+
-                "\"encPrivateB64\":\""+b64(ur.encPriv)+"\","+
-                "\"ivB64\":\""+b64(ur.iv)+"\""+
-                "}";
+                "\"username\":"+JsonUtil.quote(ur.username)+","+
+                "\"saltB64\":"+JsonUtil.quote(b64(ur.salt))+","+
+                "\"publicKeyB64\":"+JsonUtil.quote(b64(ur.publicKey.getEncoded()))+","+
+                "\"encPrivateB64\":"+JsonUtil.quote(b64(ur.encPriv))+","+
+                "\"ivB64\":"+JsonUtil.quote(b64(ur.iv))
+                +"}";
 
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
 
@@ -197,11 +200,11 @@ public final class ServerStore {
     /** Sube el JSON de un fichero cifrado para un usuario. */
     public static void uploadFile(String username, String filename, byte[] iv, byte[] cekWrapped, byte[] ciphertext, String bearerToken) throws IOException {
         String json = "{"+
-                "\"filename\":\""+esc(filename)+"\","+
-                "\"ivB64\":\""+b64(iv)+"\","+
-                "\"cekWrappedB64\":\""+b64(cekWrapped)+"\","+
-                "\"ctB64\":\""+b64(ciphertext)+"\""+
-                "}";
+                "\"filename\":"+JsonUtil.quote(filename)+","+
+                "\"ivB64\":"+JsonUtil.quote(b64(iv))+","+
+                "\"cekWrappedB64\":"+JsonUtil.quote(b64(cekWrapped))+","+
+                "\"ctB64\":"+JsonUtil.quote(b64(ciphertext))
+                +"}";
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
         HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/upload/" + username).toURL().openConnection();
         c.setRequestMethod("POST");
@@ -222,21 +225,14 @@ public final class ServerStore {
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
         String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         c.disconnect();
-        // Minimal JSON parsing: expecting array of {id, filename}
-        // Parse naively to avoid deps
-        java.util.List<String[]> out = new java.util.ArrayList<>();
-        int i = 0;
-        while (true) {
-            int idIdx = json.indexOf("\"id\":\"", i); if (idIdx<0) break;
-            int idStart = idIdx+6; int idEnd = json.indexOf('"', idStart);
-            String id = json.substring(idStart, idEnd);
-            int fnIdx = json.indexOf("\"filename\":\"", idEnd); if (fnIdx<0) break;
-            int fnStart = fnIdx+12; int fnEnd = json.indexOf('"', fnStart);
-            String filename = json.substring(fnStart, fnEnd);
-            out.add(new String[]{id, filename});
-            i = fnEnd+1;
+        List<Map<String, String>> items = JsonUtil.parseArrayOfObjects(json, 1024, 8, 1024);
+        String[][] result = new String[items.size()][2];
+        for (int i = 0; i < items.size(); i++) {
+            Map<String, String> item = items.get(i);
+            result[i][0] = require(item, "id");
+            result[i][1] = require(item, "filename");
         }
-        return out.toArray(new String[0][0]);
+        return result;
     }
 
     /** Lista ficheros compartidos conmigo: devuelve [owner, id, filename]. */
@@ -247,22 +243,15 @@ public final class ServerStore {
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
         String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         c.disconnect();
-        java.util.List<String[]> out = new java.util.ArrayList<>();
-        int i = 0;
-        while (true) {
-            int oIdx = json.indexOf("\"owner\":\"", i); if (oIdx<0) break;
-            int oStart = oIdx+9; int oEnd = json.indexOf('"', oStart);
-            String owner = json.substring(oStart, oEnd);
-            int idIdx = json.indexOf("\"id\":\"", oEnd); if (idIdx<0) break;
-            int idStart = idIdx+6; int idEnd = json.indexOf('"', idStart);
-            String id = json.substring(idStart, idEnd);
-            int fnIdx = json.indexOf("\"filename\":\"", idEnd); if (fnIdx<0) break;
-            int fnStart = fnIdx+12; int fnEnd = json.indexOf('"', fnStart);
-            String filename = json.substring(fnStart, fnEnd);
-            out.add(new String[]{owner, id, filename});
-            i = fnEnd+1;
+        List<Map<String, String>> items = JsonUtil.parseArrayOfObjects(json, 1024, 8, 1024);
+        String[][] result = new String[items.size()][3];
+        for (int i = 0; i < items.size(); i++) {
+            Map<String, String> item = items.get(i);
+            result[i][0] = require(item, "owner");
+            result[i][1] = require(item, "id");
+            result[i][2] = require(item, "filename");
         }
-        return out.toArray(new String[0][0]);
+        return result;
     }
 
     /** Descarga un fichero cifrado: GET /file/{user}/{id}. */
@@ -273,11 +262,12 @@ public final class ServerStore {
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
         String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         c.disconnect();
-        String fid = jsonGet(json, "id");
-        String fname = jsonGet(json, "filename");
-        byte[] iv = b64d(jsonGet(json, "ivB64"));
-        byte[] cekW = b64d(jsonGet(json, "cekWrappedB64"));
-        byte[] ct = b64d(jsonGet(json, "ctB64"));
+        Map<String, String> data = JsonUtil.parseObject(json, 16, 4096);
+        String fid = require(data, "id");
+        String fname = require(data, "filename");
+        byte[] iv = b64d(require(data, "ivB64"));
+        byte[] cekW = b64d(require(data, "cekWrappedB64"));
+        byte[] ct = b64d(require(data, "ctB64"));
         return new EncryptedFile(fid, fname, iv, cekW, ct);
     }
 
@@ -289,11 +279,12 @@ public final class ServerStore {
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
         String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         c.disconnect();
-        String fid = jsonGet(json, "id");
-        String fname = jsonGet(json, "filename");
-        byte[] iv = b64d(jsonGet(json, "ivB64"));
-        byte[] cekW = b64d(jsonGet(json, "cekWrappedB64"));
-        byte[] ct = b64d(jsonGet(json, "ctB64"));
+        Map<String, String> data = JsonUtil.parseObject(json, 16, 4096);
+        String fid = require(data, "id");
+        String fname = require(data, "filename");
+        byte[] iv = b64d(require(data, "ivB64"));
+        byte[] cekW = b64d(require(data, "cekWrappedB64"));
+        byte[] ct = b64d(require(data, "ctB64"));
         return new EncryptedFile(fid, fname, iv, cekW, ct);
     }
 
@@ -306,24 +297,19 @@ public final class ServerStore {
         if (c.getResponseCode() != 200) { c.disconnect(); throw new IOException("server returned " + c.getResponseCode()); }
         String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         c.disconnect();
-        java.util.List<String[]> out = new java.util.ArrayList<>();
-        int i = 0;
-        while (true) {
-            int uIdx = json.indexOf("\"username\":\"", i); if (uIdx<0) break;
-            int uStart = uIdx+12; int uEnd = json.indexOf('"', uStart);
-            String username = json.substring(uStart, uEnd);
-            int rIdx = json.indexOf("\"role\":\"", uEnd); if (rIdx<0) break;
-            int rStart = rIdx+8; int rEnd = json.indexOf('"', rStart);
-            String role = json.substring(rStart, rEnd);
-            out.add(new String[]{username, role});
-            i = rEnd+1;
+        List<Map<String, String>> items = JsonUtil.parseArrayOfObjects(json, 1024, 4, 512);
+        String[][] result = new String[items.size()][2];
+        for (int i = 0; i < items.size(); i++) {
+            Map<String, String> item = items.get(i);
+            result[i][0] = require(item, "username");
+            result[i][1] = require(item, "role");
         }
-        return out.toArray(new String[0][0]);
+        return result;
     }
 
     /** Cambia el rol de un usuario (ADMIN). */
     public static void setUserRole(String username, String role, String bearerToken) throws IOException {
-        String json = "{"+"\"username\":\""+esc(username)+"\",\"role\":\""+esc(role)+"\"}";
+        String json = "{"+"\"username\":"+JsonUtil.quote(username)+",\"role\":"+JsonUtil.quote(role)+"}";
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
         HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/admin/setRole").toURL().openConnection();
         c.setRequestMethod("POST");
@@ -338,9 +324,9 @@ public final class ServerStore {
     /** Comparte un fichero con un usuario, enviando su CEK envuelta. */
     public static void shareFile(String owner, String id, String targetUser, byte[] cekWrapped, String bearerToken) throws IOException {
         String json = "{"+
-                "\"user\":\""+esc(targetUser)+"\","+
-                "\"cekWrappedB64\":\""+b64(cekWrapped)+"\""+
-                "}";
+                "\"user\":"+JsonUtil.quote(targetUser)+","+
+                "\"cekWrappedB64\":"+JsonUtil.quote(b64(cekWrapped))
+                +"}";
         byte[] body = json.getBytes(StandardCharsets.UTF_8);
         HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/share/" + owner + "/" + id).toURL().openConnection();
         c.setRequestMethod("POST");
@@ -354,6 +340,18 @@ public final class ServerStore {
 
     // --- Métodos auxiliares de codificación/decodificación ---
 
+    private static String require(Map<String, String> map, String key) {
+        String value = map.get(key);
+        if (value == null) {
+            throw new IllegalArgumentException("missing field: " + key);
+        }
+        String trimmed = value.trim();
+        if (trimmed.isEmpty()) {
+            throw new IllegalArgumentException("empty field: " + key);
+        }
+        return trimmed;
+    }
+
     /** Codifica bytes en texto Base64 */
     private static String b64(byte[] x) {
         return Base64.getEncoder().encodeToString(x);
@@ -362,25 +360,6 @@ public final class ServerStore {
     /** Decodifica texto Base64 a bytes */
     private static byte[] b64d(String s) {
         return Base64.getDecoder().decode(s);
-    }
-
-    /** Escapa comillas para insertar texto dentro de JSON */
-    private static String esc(String s) {
-        return s == null ? "" : s.replace("\"", "\\\"");
-    }
-
-    /**
-     * Extrae un valor de un JSON plano en formato:
-     * {"clave":"valor"}
-     */
-    private static String jsonGet(String json, String key) {
-        String pat = "\"" + key + "\":\"";
-        int i = json.indexOf(pat);
-        if (i<0) return null;
-        int start = i + pat.length();
-        int end = json.indexOf('"', start);
-        if (end<0) return null;
-        return json.substring(start, end);
     }
 
     /** Configura HTTPS para confiar en cualquier certificado (solo DEV). */
