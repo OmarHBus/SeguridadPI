@@ -39,6 +39,7 @@ public final class AuthApp extends JFrame {
     private PrivateKey currentPrivateKey = null;
     private String currentRole = null;
     private String bearerToken = null;
+    private boolean totpEnabled = false;
 
     public AuthApp() {
         super("Demo Registro / Login (PBKDF2 + RSA) – Cliente/Servidor");
@@ -52,6 +53,7 @@ public final class AuthApp extends JFrame {
         tabs.addTab("Ficheros", buildFilesPanel());
         tabs.addTab("Compartidos conmigo", buildSharedPanel());
         tabs.addTab("Administración", buildAdminPanel());
+        tabs.addTab("Seguridad", buildSecurityPanel());
         add(tabs);
     }
 
@@ -136,6 +138,7 @@ public final class AuthApp extends JFrame {
     private void doLogin() {
         String u = logUser.getText().trim();
         char[] p = logPass.getPassword();
+        totpEnabled = false;
 
         if (u.isEmpty() || p.length==0) { msg("Rellena usuario y contraseña"); wipe(p); return; }
         if (!isValidUsername(u)) { msg("El usuario debe tener 3-32 caracteres y solo puede contener letras, números, punto, guion y guion bajo"); wipe(p); return; }
@@ -163,18 +166,48 @@ public final class AuthApp extends JFrame {
             s.update(nonce);
             String sigB64 = java.util.Base64.getEncoder().encodeToString(s.sign());
 
-            // Finalizar auth y recibir token/rol
-            String[] tk = ServerStore.authFinish(u, nonceB64, sigB64);
+            // Finalizar auth y recibir token/rol o requerimiento de TOTP
+            ServerStore.AuthResult initial = ServerStore.authFinish(u, nonceB64, sigB64);
+            ServerStore.AuthResult finalResult = initial;
+            if (initial.totpRequired) {
+                while (true) {
+                    String code = JOptionPane.showInputDialog(this, "Introduce el código 2FA (6 dígitos):");
+                    if (code == null) {
+                        msg("Login cancelado");
+                        wipe(p);
+                        return;
+                    }
+                    code = code.trim();
+                    if (!code.matches("\\d{6}")) {
+                        msg("Código inválido");
+                        continue;
+                    }
+                    try {
+                        finalResult = ServerStore.authTotp(initial.ticket, code);
+                        break;
+                    } catch (IOException io) {
+                        msg("Código incorrecto: " + io.getMessage());
+                    }
+                }
+            }
+
+            if (!finalResult.ok) {
+                wipe(p);
+                msg("Autenticación incompleta");
+                return;
+            }
 
             // Guardar estado
             this.currentUsername = u;
             this.currentPublicKey = pub;
             this.currentPrivateKey = priv;
-            this.bearerToken = tk[0];
-            this.currentRole = tk[1];
+            this.bearerToken = finalResult.token;
+            this.currentRole = finalResult.role;
+            this.totpEnabled = finalResult.totpEnabled;
 
             wipe(p);
             msg("Login OK como '" + u + "' (" + currentRole + ")");
+            updateSecurityStatus();
             refreshFilesList();
         } catch (IOException io) {
             wipe(p);
@@ -222,6 +255,7 @@ public final class AuthApp extends JFrame {
     private final JList<String> filesList = new JList<>(filesModel);
     private final java.util.Map<String,String> idxToId = new java.util.LinkedHashMap<>(); // índice -> id
     private final JLabel sessionLabel = new JLabel("No autenticado");
+    private final JLabel totpStatusLabel = new JLabel("No autenticado");
 
     private final DefaultListModel<String> sharedModel = new DefaultListModel<>();
     private final JList<String> sharedList = new JList<>(sharedModel);
@@ -287,6 +321,21 @@ public final class AuthApp extends JFrame {
         p.add(new JScrollPane(usersList), BorderLayout.CENTER);
         return p;
     }
+
+    private JPanel buildSecurityPanel() {
+        JPanel p = new JPanel(new BorderLayout());
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        top.add(new JLabel("Estado 2FA: "));
+        top.add(totpStatusLabel);
+        JButton setup = new JButton("Configurar 2FA");
+        setup.addActionListener(e -> doSetupTotp());
+        JButton disable = new JButton("Desactivar 2FA");
+        disable.addActionListener(e -> doDisableTotp());
+        top.add(setup);
+        top.add(disable);
+        p.add(top, BorderLayout.NORTH);
+        return p;
+    }
     // Comentario de lo que hace el metodo refreshFilesList:
     // Este método se encarga de actualizar la lista de archivos disponibles para el usuario.
     // Primero verifica si el usuario está autenticado.
@@ -298,9 +347,11 @@ public final class AuthApp extends JFrame {
         if (currentUsername == null) {
             sessionLabel.setText("No autenticado");
             filesModel.clear();
+            updateSecurityStatus();
             return;
         }
         sessionLabel.setText(currentUsername + (currentRole!=null? " ("+currentRole+")":""));
+        updateSecurityStatus();
         try {
             String[][] files = ServerStore.listFiles(currentUsername, bearerToken);
             filesModel.clear();
@@ -466,6 +517,66 @@ public final class AuthApp extends JFrame {
         } catch (Exception ex) {
             ex.printStackTrace();
             msg("Error revocando: " + ex.getMessage());
+        }
+    }
+
+    private void doSetupTotp() {
+        if (currentUsername == null) { msg("Inicia sesión primero"); return; }
+        try {
+            ServerStore.TotpEnrollResponse resp = ServerStore.totpEnroll(bearerToken);
+            String mensaje = "Añade esta cuenta a tu app TOTP."+
+                    "\nSecret: " + resp.secret +
+                    "\nURI: " + resp.otpauthUri +
+                    "\nEscanéalo o introdúcelo manualmente y después confirma con un código de 6 dígitos.";
+            JOptionPane.showMessageDialog(this, mensaje, "Configurar 2FA", JOptionPane.INFORMATION_MESSAGE);
+            while (true) {
+                String code = JOptionPane.showInputDialog(this, "Introduce el código 2FA (6 dígitos):");
+                if (code == null) {
+                    msg("Activación cancelada");
+                    return;
+                }
+                code = code.trim();
+                if (code.isBlank()) continue;
+                try {
+                    ServerStore.totpConfirm(code, bearerToken);
+                    totpEnabled = true;
+                    updateSecurityStatus();
+                    msg("2FA activado correctamente");
+                    return;
+                } catch (IOException io) {
+                    msg("Código incorrecto: " + io.getMessage());
+                }
+            }
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            msg("Error configurando 2FA: " + ex.getMessage());
+        }
+    }
+
+    private void doDisableTotp() {
+        if (currentUsername == null) { msg("Inicia sesión primero"); return; }
+        if (!totpEnabled) {
+            msg("El 2FA ya está deshabilitado");
+            return;
+        }
+        int r = JOptionPane.showConfirmDialog(this, "¿Seguro que deseas desactivar el 2FA?", "Desactivar 2FA", JOptionPane.YES_NO_OPTION);
+        if (r != JOptionPane.YES_OPTION) return;
+        try {
+            ServerStore.totpDisable(bearerToken);
+            totpEnabled = false;
+            updateSecurityStatus();
+            msg("2FA desactivado");
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            msg("Error desactivando 2FA: " + ex.getMessage());
+        }
+    }
+
+    private void updateSecurityStatus() {
+        if (currentUsername == null) {
+            totpStatusLabel.setText("No autenticado");
+        } else {
+            totpStatusLabel.setText(totpEnabled ? "2FA habilitado" : "2FA deshabilitado");
         }
     }
 

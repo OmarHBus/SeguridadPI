@@ -59,6 +59,26 @@ public final class ServerStore {
         }
     }
 
+    public static final class AuthResult {
+        public final boolean ok;
+        public final boolean totpRequired;
+        public final String token;
+        public final String role;
+        public final String ticket;
+        public final boolean totpEnabled;
+        public AuthResult(boolean ok, boolean totpRequired, String token, String role, String ticket, boolean totpEnabled) {
+            this.ok = ok; this.totpRequired = totpRequired; this.token = token; this.role = role; this.ticket = ticket; this.totpEnabled = totpEnabled;
+        }
+    }
+
+    public static final class TotpEnrollResponse {
+        public final String secret;
+        public final String otpauthUri;
+        public TotpEnrollResponse(String secret, String otpauthUri) {
+            this.secret = secret; this.otpauthUri = otpauthUri;
+        }
+    }
+
     /** Estructura para ficheros cifrados descargados. */
     public static final class EncryptedFile {
         public final String id;
@@ -143,7 +163,7 @@ public final class ServerStore {
     }
 
     /** Finaliza autenticación: envía firma, recibe token y rol. */
-    public static String[] authFinish(String username, String nonceB64, String signatureB64) throws IOException {
+    public static AuthResult authFinish(String username, String nonceB64, String signatureB64) throws IOException {
         String json = "{"+
                 "\"username\":"+JsonUtil.quote(username)+","+
                 "\"nonceB64\":"+JsonUtil.quote(nonceB64)+","+
@@ -160,10 +180,47 @@ public final class ServerStore {
         String resp = stream != null ? new String(stream.readAllBytes(), StandardCharsets.UTF_8) : "";
         c.disconnect();
         if (code != 200) { throw new IOException(buildErrorMessage(code, resp)); }
-        Map<String, String> data = JsonUtil.parseObject(resp, 8, 1024);
+        Map<String, String> data = JsonUtil.parseObject(resp, 12, 1024);
+        boolean ok = Boolean.parseBoolean(data.getOrDefault("ok", "false"));
+        boolean totpRequired = Boolean.parseBoolean(data.getOrDefault("totpRequired", "false"));
+        if (totpRequired) {
+            String ticket = require(data, "ticket");
+            String role = require(data, "role");
+            return new AuthResult(false, true, null, role, ticket, true);
+        }
+        if (!ok) {
+            throw new IOException("authentication failed");
+        }
         String token = require(data, "token");
         String role = require(data, "role");
-        return new String[]{token, role};
+        boolean totpEnabled = Boolean.parseBoolean(data.getOrDefault("totpEnabled", "false"));
+        return new AuthResult(true, false, token, role, null, totpEnabled);
+    }
+
+    /** Completa el login introduciendo el código TOTP. */
+    public static AuthResult authTotp(String ticket, String code) throws IOException {
+        String json = "{"+
+                "\"ticket\":"+JsonUtil.quote(ticket)+","+
+                "\"code\":"+JsonUtil.quote(code)
+                +"}";
+        byte[] body = json.getBytes(StandardCharsets.UTF_8);
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/auth/totp").toURL().openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type","application/json; charset=utf-8");
+        try (OutputStream os = c.getOutputStream()) { os.write(body); }
+        int codeResp = c.getResponseCode();
+        InputStream stream = codeResp >= 200 && codeResp < 300 ? c.getInputStream() : c.getErrorStream();
+        String resp = stream != null ? new String(stream.readAllBytes(), StandardCharsets.UTF_8) : "";
+        c.disconnect();
+        if (codeResp != 200) { throw new IOException(buildErrorMessage(codeResp, resp)); }
+        Map<String, String> data = JsonUtil.parseObject(resp, 8, 1024);
+        boolean ok = Boolean.parseBoolean(data.getOrDefault("ok", "false"));
+        if (!ok) { throw new IOException("authentication failed"); }
+        String token = require(data, "token");
+        String role = require(data, "role");
+        boolean totpEnabled = Boolean.parseBoolean(data.getOrDefault("totpEnabled", "true"));
+        return new AuthResult(true, false, token, role, null, totpEnabled);
     }
 
     /**
@@ -367,6 +424,52 @@ public final class ServerStore {
         String body = stream != null ? new String(stream.readAllBytes(), StandardCharsets.UTF_8) : "";
         c.disconnect();
         if (code != 200) { throw new IOException(buildErrorMessage(code, body)); }
+    }
+
+    public static TotpEnrollResponse totpEnroll(String bearerToken) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/totp/enroll").toURL().openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type","application/json; charset=utf-8");
+        if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
+        try (OutputStream os = c.getOutputStream()) { os.write("{}".getBytes(StandardCharsets.UTF_8)); }
+        int code = c.getResponseCode();
+        InputStream stream = code >= 200 && code < 300 ? c.getInputStream() : c.getErrorStream();
+        String resp = stream != null ? new String(stream.readAllBytes(), StandardCharsets.UTF_8) : "";
+        c.disconnect();
+        if (code != 200) { throw new IOException(buildErrorMessage(code, resp)); }
+        Map<String, String> data = JsonUtil.parseObject(resp, 4, 256);
+        return new TotpEnrollResponse(require(data, "secret"), require(data, "otpauthUri"));
+    }
+
+    public static void totpConfirm(String code, String bearerToken) throws IOException {
+        String json = "{"+"\"code\":"+JsonUtil.quote(code)+"}";
+        byte[] body = json.getBytes(StandardCharsets.UTF_8);
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/totp/confirm").toURL().openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type","application/json; charset=utf-8");
+        if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
+        try (OutputStream os = c.getOutputStream()) { os.write(body); }
+        int codeResp = c.getResponseCode();
+        InputStream stream = codeResp >= 200 && codeResp < 300 ? c.getInputStream() : c.getErrorStream();
+        String resp = stream != null ? new String(stream.readAllBytes(), StandardCharsets.UTF_8) : "";
+        c.disconnect();
+        if (codeResp != 200) { throw new IOException(buildErrorMessage(codeResp, resp)); }
+    }
+
+    public static void totpDisable(String bearerToken) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) URI.create(BASE + "/totp/disable").toURL().openConnection();
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type","application/json; charset=utf-8");
+        if (bearerToken != null) c.setRequestProperty("Authorization", "Bearer " + bearerToken);
+        try (OutputStream os = c.getOutputStream()) { os.write("{}".getBytes(StandardCharsets.UTF_8)); }
+        int code = c.getResponseCode();
+        InputStream stream = code >= 200 && code < 300 ? c.getInputStream() : c.getErrorStream();
+        String resp = stream != null ? new String(stream.readAllBytes(), StandardCharsets.UTF_8) : "";
+        c.disconnect();
+        if (code != 200) { throw new IOException(buildErrorMessage(code, resp)); }
     }
 
     // --- Métodos auxiliares de codificación/decodificación ---

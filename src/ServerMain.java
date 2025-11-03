@@ -9,6 +9,7 @@ import com.sun.net.httpserver.HttpsServer;  // HTTPS server variant
 import java.io.*;                           // Streams, readers, writers, IOExceptions
 import java.net.InetSocketAddress;          // Address/port binding
 import java.net.URI;                        // URI inspection helpers
+import java.net.URLEncoder;                 // Codificar parámetros en URIs
 import java.nio.charset.StandardCharsets;   // Stable UTF-8 charset
 import java.nio.file.*;                     // Paths, Files for reading/writing .properties
 import java.util.Properties;                // Simple key=value storage (.properties)
@@ -64,10 +65,16 @@ public class ServerMain {
     private static final byte[] TOKEN_SECRET = initTokenSecret();        //SECRET PARA FIRMAR LOS TOKENS
     private static final byte[] META_HMAC_SECRET = "P1-META-HMAC-KEY-2025".getBytes(StandardCharsets.UTF_8);
     private static final Object AUDIT_LOCK = new Object();               //LOCK PARA EL AUDIT LOG
+    private static final int TOTP_SECRET_BYTES = 20;
+    private static final int TOTP_STEP_SECONDS = 30;
+    private static final int TOTP_DIGITS = 6;
+    private static final int TOTP_ALLOWED_DRIFT = 1;
+    private static final long TOTP_PENDING_TTL_MILLIS = Duration.ofMinutes(2).toMillis();
 
     // In-memory session storage (MVP): token -> (user, role)
     private static final Map<String, Session> SESSIONS = new HashMap<>();
     private static final Map<String, FailedLogin> FAILED_LOGINS = new HashMap<>();    //MAPA DE INTENTOS FALLIDOS
+    private static final Map<String, PendingTotp> PENDING_TOTP = new HashMap<>();
     private static final class Session {                                        //CLASE DE LA SESSION
         final String user;                                             //USUARIO
         final String role;                                             //ROL
@@ -87,6 +94,21 @@ public class ServerMain {
         long lastFailure;                                            //ULTIMO FALLO
         long lockedUntil;
     }                                                       //TIEMPO DE BLOQUEO
+
+    private static final class PendingTotp {
+        final String user;
+        final String role;
+        final long expiresAt;
+        final String clientIp;
+        final String secret;
+        PendingTotp(String user, String role, long expiresAt, String clientIp, String secret) {
+            this.user = user;
+            this.role = role;
+            this.expiresAt = expiresAt;
+            this.clientIp = clientIp;
+            this.secret = secret;
+        }
+    }
 
     /** Starts the embedded HTTP server and registers routes. */
     public static void main(String[] args) throws Exception {
@@ -499,6 +521,27 @@ public class ServerMain {
 
                 clearFailures(user);
                 String role = p.getProperty("role","USER").toUpperCase();
+                String secret = p.getProperty("totpSecret");
+                boolean totpEnabled = "true".equalsIgnoreCase(p.getProperty("totpEnabled", "false"))
+                        && secret != null && !secret.isBlank();
+                if (totpEnabled) {
+                    String ticket = UUID.randomUUID().toString().replace("-", "");
+                    long pendingExpires = System.currentTimeMillis() + TOTP_PENDING_TTL_MILLIS;
+                    String ip = clientIp(exchange);
+                    synchronized (PENDING_TOTP) {
+                        PENDING_TOTP.put(ticket, new PendingTotp(user, role, pendingExpires, ip, secret));
+                    }
+                    logAudit("TOTP_REQUIRED", user, exchange, "ticket="+ticket);
+                    String out = "{"+
+                            "\"ok\":false,"+
+                            "\"totpRequired\":true,"+
+                            "\"ticket\":"+JsonUtil.quote(ticket)+","+
+                            "\"role\":"+JsonUtil.quote(role)+","+
+                            "\"username\":"+JsonUtil.quote(user) +""+
+                            "}";
+                    sendJson(exchange, 200, out);
+                    return;
+                }
                 long expiresAt = System.currentTimeMillis() + SESSION_TTL_MILLIS;
                 String tokenId = UUID.randomUUID().toString().replace("-", "");
                 String payload = tokenId + "." + expiresAt;
@@ -514,8 +557,70 @@ public class ServerMain {
                         "\"ok\":true,"+
                         "\"token\":"+JsonUtil.quote(bearer)+","+
                         "\"role\":"+JsonUtil.quote(role)+","+
-                        "\"username\":"+JsonUtil.quote(user)
-                        +"}";
+                        "\"username\":"+JsonUtil.quote(user)+","+
+                        "\"totpEnabled\":false"+
+                        "}";
+                sendJson(exchange, 200, out);
+            } catch (Exception e) { send(exchange, 500, e.toString()); }
+        });
+
+        srv.createContext("/auth/totp", exchange -> {
+            try {
+                if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
+                String body;
+                try {
+                    body = readBody(exchange, MAX_GENERIC_BODY);
+                } catch (IllegalArgumentException tooBig) {
+                    send(exchange, 413, "body too large");
+                    return;
+                }
+                Map<String, String> data = JsonUtil.parseObject(body, 6, 256);
+                String ticket = require(data, "ticket");
+                String code = require(data, "code");
+                if (!code.matches("\\d{"+TOTP_DIGITS+"}")) {
+                    send(exchange, 400, "invalid code");
+                    return;
+                }
+                PendingTotp pending;
+                long now = System.currentTimeMillis();
+                synchronized (PENDING_TOTP) {
+                    pending = PENDING_TOTP.get(ticket);
+                    if (pending != null && now > pending.expiresAt) {
+                        PENDING_TOTP.remove(ticket);
+                        pending = null;
+                    }
+                }
+                if (pending == null) { send(exchange, 404, "ticket not found"); return; }
+                String ip = clientIp(exchange);
+                if (!pending.clientIp.equals(ip)) {
+                    logAudit("TOTP_VERIFY_FAIL", pending.user, exchange, "ip mismatch");
+                    send(exchange, 403, "ip mismatch");
+                    return;
+                }
+                if (!verifyTotp(pending.secret, code)) {
+                    logAudit("TOTP_VERIFY_FAIL", pending.user, exchange, "wrong code");
+                    send(exchange, 401, "wrong code");
+                    return;
+                }
+                synchronized (PENDING_TOTP) { PENDING_TOTP.remove(ticket); }
+                long expiresAt = now + SESSION_TTL_MILLIS;
+                String tokenId = UUID.randomUUID().toString().replace("-", "");
+                String payload = tokenId + "." + expiresAt;
+                String signature = signToken(payload);
+                String bearer = payload + "." + signature;
+                final PendingTotp pendingFinal = pending;
+                synchronized (SESSIONS) {
+                    SESSIONS.entrySet().removeIf(e -> e.getValue().user.equals(pendingFinal.user));
+                    SESSIONS.put(tokenId, new Session(pendingFinal.user, pendingFinal.role, expiresAt, ip, signature));
+                }
+                logAudit("TOTP_VERIFY_SUCCESS", pending.user, exchange, "ticket="+ticket);
+                String out = "{"+
+                        "\"ok\":true,"+
+                        "\"token\":"+JsonUtil.quote(bearer)+","+
+                        "\"role\":"+JsonUtil.quote(pending.role)+","+
+                        "\"username\":"+JsonUtil.quote(pending.user)+","+
+                        "\"totpEnabled\":true"+
+                        "}";
                 sendJson(exchange, 200, out);
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
@@ -703,6 +808,83 @@ public class ServerMain {
                 try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "File record"); }
                 logAudit("FILE_SHARE_REVOKE", sess.user, exchange, "owner="+owner+",id="+id+",target="+target);
                 send(exchange, 200, "revoked");
+            } catch (Exception e) { send(exchange, 500, e.toString()); }
+        });
+
+        srv.createContext("/totp/enroll", exchange -> {
+            try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
+                if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
+                Path f = ROOT.resolve(sess.user + ".properties");
+                if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
+                Properties p = new Properties();
+                try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                ensureMetaHmac(f, p, "User record");
+                String secret = generateTotpSecret();
+                p.setProperty("totpSecret", secret);
+                p.setProperty("totpEnabled", "false");
+                p.setProperty("metaHmac", computeMetaHmac(p));
+                try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
+                String uri = "otpauth://totp/" + URLEncoder.encode("P1:" + sess.user, StandardCharsets.UTF_8)
+                        + "?secret=" + secret + "&issuer=" + URLEncoder.encode("P1", StandardCharsets.UTF_8);
+                logAudit("TOTP_ENROLL_START", sess.user, exchange, "");
+                String out = "{"+
+                        "\"secret\":"+JsonUtil.quote(secret)+","+
+                        "\"otpauthUri\":"+JsonUtil.quote(uri)+""+
+                        "}";
+                sendJson(exchange, 200, out);
+            } catch (Exception e) { send(exchange, 500, e.toString()); }
+        });
+
+        srv.createContext("/totp/confirm", exchange -> {
+            try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
+                if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
+                String body = readBody(exchange, MAX_GENERIC_BODY);
+                Map<String, String> data = JsonUtil.parseObject(body, 4, 256);
+                String code = require(data, "code");
+                if (!code.matches("\\d{"+TOTP_DIGITS+"}")) { send(exchange, 400, "invalid code"); return; }
+                Path f = ROOT.resolve(sess.user + ".properties");
+                if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
+                Properties p = new Properties();
+                try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                ensureMetaHmac(f, p, "User record");
+                String secret = p.getProperty("totpSecret");
+                if (secret == null || secret.isBlank()) { send(exchange, 409, "totp not enrolled"); return; }
+                if (!verifyTotp(secret, code)) {
+                    logAudit("TOTP_VERIFY_FAIL", sess.user, exchange, "enroll confirm");
+                    send(exchange, 401, "wrong code");
+                    return;
+                }
+                p.setProperty("totpEnabled", "true");
+                p.setProperty("metaHmac", computeMetaHmac(p));
+                try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
+                logAudit("TOTP_ENROLL_CONFIRMED", sess.user, exchange, "");
+                send(exchange, 200, "ok");
+            } catch (Exception e) { send(exchange, 500, e.toString()); }
+        });
+
+        srv.createContext("/totp/disable", exchange -> {
+            try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
+                if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
+                Path f = ROOT.resolve(sess.user + ".properties");
+                if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
+                Properties p = new Properties();
+                try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                ensureMetaHmac(f, p, "User record");
+                p.remove("totpSecret");
+                p.remove("totpEnabled");
+                p.setProperty("metaHmac", computeMetaHmac(p));
+                try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
+                synchronized (PENDING_TOTP) {
+                    PENDING_TOTP.entrySet().removeIf(e -> e.getValue().user.equals(sess.user));
+                }
+                logAudit("TOTP_DISABLED", sess.user, exchange, "");
+                send(exchange, 200, "disabled");
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
         
@@ -971,6 +1153,99 @@ public class ServerMain {
             diff |= x[i] ^ y[i];
         }
         return diff == 0;
+    }
+
+    private static String generateTotpSecret() {
+        byte[] secret = new byte[TOTP_SECRET_BYTES];
+        RNG.nextBytes(secret);
+        return base32Encode(secret);
+    }
+
+    private static boolean verifyTotp(String secretB32, String code) {
+        try {
+            byte[] key = base32Decode(secretB32);
+            long now = System.currentTimeMillis() / 1000L;
+            long timestep = now / TOTP_STEP_SECONDS;
+            for (int i = -TOTP_ALLOWED_DRIFT; i <= TOTP_ALLOWED_DRIFT; i++) {
+                String expected = formatTotp(totpCode(key, timestep + i));
+                if (expected.equals(code)) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {
+            return false;
+        }
+        return false;
+    }
+
+    private static String formatTotp(int value) {
+        String s = Integer.toString(value);
+        while (s.length() < TOTP_DIGITS) s = "0" + s;
+        return s;
+    }
+
+    private static int totpCode(byte[] key, long counter) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA1");
+        mac.init(new SecretKeySpec(key, "HmacSHA1"));
+        byte[] counterBytes = new byte[8];
+        for (int i = 7; i >= 0; i--) {
+            counterBytes[i] = (byte) (counter & 0xFF);
+            counter >>= 8;
+        }
+        byte[] hash = mac.doFinal(counterBytes);
+        int offset = hash[hash.length - 1] & 0xF;
+        int binary = ((hash[offset] & 0x7F) << 24)
+                | ((hash[offset + 1] & 0xFF) << 16)
+                | ((hash[offset + 2] & 0xFF) << 8)
+                | (hash[offset + 3] & 0xFF);
+        int mod = (int) Math.pow(10, TOTP_DIGITS);
+        return binary % mod;
+    }
+
+    private static final char[] BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".toCharArray();
+
+    private static String base32Encode(byte[] data) {
+        StringBuilder sb = new StringBuilder((data.length * 8 + 4) / 5);
+        int buffer = 0;
+        int bitsLeft = 0;
+        for (byte b : data) {
+            buffer = (buffer << 8) | (b & 0xFF);
+            bitsLeft += 8;
+            while (bitsLeft >= 5) {
+                int index = (buffer >> (bitsLeft - 5)) & 0x1F;
+                bitsLeft -= 5;
+                sb.append(BASE32_ALPHABET[index]);
+            }
+        }
+        if (bitsLeft > 0) {
+            sb.append(BASE32_ALPHABET[(buffer << (5 - bitsLeft)) & 0x1F]);
+        }
+        return sb.toString();
+    }
+
+    private static byte[] base32Decode(String s) {
+        int buffer = 0;
+        int bitsLeft = 0;
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        for (char ch : s.toUpperCase().toCharArray()) {
+            int val;
+            if (ch >= 'A' && ch <= 'Z') {
+                val = ch - 'A';
+            } else if (ch >= '2' && ch <= '7') {
+                val = ch - '2' + 26;
+            } else if (ch == '=' || ch == ' ') {
+                continue;
+            } else {
+                throw new IllegalArgumentException("invalid base32");
+            }
+            buffer = (buffer << 5) | val;
+            bitsLeft += 5;
+            if (bitsLeft >= 8) {
+                baos.write((buffer >> (bitsLeft - 8)) & 0xFF);
+                bitsLeft -= 8;
+            }
+        }
+        return baos.toByteArray();
     }
 
     private static String clientIp(HttpExchange ex) {
