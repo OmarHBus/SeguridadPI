@@ -55,6 +55,7 @@
 - El servidor expone `/totp/enroll`, `/totp/confirm`, `/totp/disable` y `/auth/totp`; genera secretos TOTP en Base32, los firma con `metaHmac` y audita cada paso (`TOTP_ENROLL_*`, `TOTP_VERIFY_*`).
 - `/auth/finish` ahora devuelve un ticket cuando el usuario tiene 2FA activo; el token de sesión solo se emite tras verificar el código en `/auth/totp`.
 - El cliente Swing añade pestaña “Seguridad” con botones para configurar o desactivar el 2FA, mostrando el secreto y la URI `otpauth://`; el login solicita automáticamente el código cuando el servidor lo requiere.
+- El registro exige un identificador con formato DNI (8 dígitos y letra) y un nombre completo; los listados y la auditoría usan ese nombre real como referencia.
 
 ## Impacto en el proyecto
 - Aporta una segunda barrera frente al secuestro de credenciales, elevando el nivel de madurez del sistema sin depender de servicios externos.
