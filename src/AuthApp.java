@@ -1,6 +1,7 @@
 // Librerías de interfaz gráfica (Swing y AWT)
 import javax.swing.*;  // Proporciona los componentes de la interfaz gráfica: JFrame, JButton, JTextField, etc.
 import java.awt.*;     // Contiene clases para el diseño visual y manejo de gráficos (layouts, colores, fuentes, etc.)
+import java.io.IOException;                // Manejo de errores de red
 
 // Librerías de criptografía y gestión de claves
 import java.security.KeyFactory;           // Permite reconstruir objetos de tipo Key (PrivateKey, PublicKey) a partir de su representación codificada
@@ -8,6 +9,8 @@ import java.security.KeyPair;              // Representa un par de claves (una p
 import java.security.PrivateKey;           // Clase que define una clave privada (para descifrar o firmar)
 import java.security.PublicKey;            // Clase que define una clave pública (para cifrar o verificar firmas)
 import java.security.spec.PKCS8EncodedKeySpec; // Especifica el formato estandarizado PKCS#8 para representar una clave privada codificada en bytes
+import java.util.Map;                      // JSON key/value handling on the client
+import java.util.regex.Pattern;            // Username validation pattern
 
 /**
  * Interfaz gráfica de autenticación y registro.
@@ -19,6 +22,8 @@ import java.security.spec.PKCS8EncodedKeySpec; // Especifica el formato estandar
  *  - AES-GCM para proteger la clave privada con una clave derivada.
  */
 public final class AuthApp extends JFrame {
+
+    private static final Pattern USERNAME_PATTERN = Pattern.compile("^[a-zA-Z0-9_.-]{3,32}$");
 
     // Campos de registro
     private final JTextField regUser = new JTextField(18);
@@ -34,11 +39,12 @@ public final class AuthApp extends JFrame {
     private PrivateKey currentPrivateKey = null;
     private String currentRole = null;
     private String bearerToken = null;
+    private boolean totpEnabled = false;
 
     public AuthApp() {
         super("Demo Registro / Login (PBKDF2 + RSA) – Cliente/Servidor");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setSize(460, 280);
+        setSize(700, 450);
         setLocationRelativeTo(null); // Centra la ventana
 
         JTabbedPane tabs = new JTabbedPane();
@@ -47,6 +53,7 @@ public final class AuthApp extends JFrame {
         tabs.addTab("Ficheros", buildFilesPanel());
         tabs.addTab("Compartidos conmigo", buildSharedPanel());
         tabs.addTab("Administración", buildAdminPanel());
+        tabs.addTab("Seguridad", buildSecurityPanel());
         add(tabs);
     }
 
@@ -98,6 +105,7 @@ public final class AuthApp extends JFrame {
         char[] p = regPass.getPassword();
 
         if (u.isEmpty() || p.length==0) { msg("Rellena usuario y contraseña"); wipe(p); return; }
+        if (!isValidUsername(u)) { msg("El usuario debe tener 3-32 caracteres y solo puede contener letras, números, punto, guion y guion bajo"); wipe(p); return; }
 
         try {
             // 0) Comprobar en servidor si existe
@@ -130,13 +138,16 @@ public final class AuthApp extends JFrame {
     private void doLogin() {
         String u = logUser.getText().trim();
         char[] p = logPass.getPassword();
+        totpEnabled = false;
 
         if (u.isEmpty() || p.length==0) { msg("Rellena usuario y contraseña"); wipe(p); return; }
+        if (!isValidUsername(u)) { msg("El usuario debe tener 3-32 caracteres y solo puede contener letras, números, punto, guion y guion bajo"); wipe(p); return; }
 
         try {
             // 0) Iniciar auth: obtener nonce. Para claves/salt usa /user (parser ya probado)
             String start = ServerStore.authStart(u);
-            String nonceB64 = extract(start, "nonceB64");
+            Map<String, String> startData = JsonUtil.parseObject(start, 12, 4096);
+            String nonceB64 = requireField(startData, "nonceB64");
             var recOpt = ServerStore.load(u);
             if (recOpt.isEmpty()) { msg("Usuario no existe en servidor"); wipe(p); return; }
             var rec = recOpt.get();
@@ -155,19 +166,52 @@ public final class AuthApp extends JFrame {
             s.update(nonce);
             String sigB64 = java.util.Base64.getEncoder().encodeToString(s.sign());
 
-            // Finalizar auth y recibir token/rol
-            String[] tk = ServerStore.authFinish(u, nonceB64, sigB64);
+            // Finalizar auth y recibir token/rol o requerimiento de TOTP
+            ServerStore.AuthResult initial = ServerStore.authFinish(u, nonceB64, sigB64);
+            ServerStore.AuthResult finalResult = initial;
+            if (initial.totpRequired) {
+                while (true) {
+                    String code = JOptionPane.showInputDialog(this, "Introduce el código 2FA (6 dígitos):");
+                    if (code == null) {
+                        msg("Login cancelado");
+                        wipe(p);
+                        return;
+                    }
+                    code = code.trim();
+                    if (!code.matches("\\d{6}")) {
+                        msg("Código inválido");
+                        continue;
+                    }
+                    try {
+                        finalResult = ServerStore.authTotp(initial.ticket, code);
+                        break;
+                    } catch (IOException io) {
+                        msg("Código incorrecto: " + io.getMessage());
+                    }
+                }
+            }
+
+            if (!finalResult.ok) {
+                wipe(p);
+                msg("Autenticación incompleta");
+                return;
+            }
 
             // Guardar estado
             this.currentUsername = u;
             this.currentPublicKey = pub;
             this.currentPrivateKey = priv;
-            this.bearerToken = tk[0];
-            this.currentRole = tk[1];
+            this.bearerToken = finalResult.token;
+            this.currentRole = finalResult.role;
+            this.totpEnabled = finalResult.totpEnabled;
 
             wipe(p);
             msg("Login OK como '" + u + "' (" + currentRole + ")");
+            updateSecurityStatus();
             refreshFilesList();
+        } catch (IOException io) {
+            wipe(p);
+            msg("Error en login: " + io.getMessage());
         } catch (Exception ex) {
             wipe(p);
             ex.printStackTrace();
@@ -175,20 +219,21 @@ public final class AuthApp extends JFrame {
         }
     }
 
-    /** Extrae un valor de JSON plano "key":"value". */
-    private static String extract(String json, String key) {
-        String pat = "\""+key+"\":\"";
-        int i = json.indexOf(pat);
-        if (i<0) return null;
-        int s = i + pat.length();
-        int e = json.indexOf('"', s);
-        if (e<0) return null;
-        return json.substring(s, e);
-    }
-
     /** Reconstruye una PrivateKey RSA desde bytes PKCS#8. */
     private static PrivateKey buildPrivateFromPkcs8(byte[] pkcs8) throws Exception {
         return KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(pkcs8));
+    }
+
+    private static boolean isValidUsername(String username) {
+        return username != null && USERNAME_PATTERN.matcher(username).matches();
+    }
+
+    private static String requireField(Map<String, String> json, String key) {
+        String value = json.get(key);
+        if (value == null) throw new IllegalArgumentException("Falta el campo " + key);
+        String trimmed = value.trim();
+        if (trimmed.isEmpty()) throw new IllegalArgumentException("Campo vacío: " + key);
+        return trimmed;
     }
 
     /** Muestra un diálogo modal con un mensaje. */
@@ -210,6 +255,7 @@ public final class AuthApp extends JFrame {
     private final JList<String> filesList = new JList<>(filesModel);
     private final java.util.Map<String,String> idxToId = new java.util.LinkedHashMap<>(); // índice -> id
     private final JLabel sessionLabel = new JLabel("No autenticado");
+    private final JLabel totpStatusLabel = new JLabel("No autenticado");
 
     private final DefaultListModel<String> sharedModel = new DefaultListModel<>();
     private final JList<String> sharedList = new JList<>(sharedModel);
@@ -237,9 +283,12 @@ public final class AuthApp extends JFrame {
         download.addActionListener(e -> doDownloadSelected());
         JButton share = new JButton("Compartir");
         share.addActionListener(e -> doShareSelected());
+        JButton revoke = new JButton("Revocar");
+        revoke.addActionListener(e -> doRevokeSelected());
         top.add(upload);
         top.add(download);
         top.add(share);
+        top.add(revoke);
         p.add(top, BorderLayout.NORTH);
 
         p.add(new JScrollPane(filesList), BorderLayout.CENTER);
@@ -272,6 +321,21 @@ public final class AuthApp extends JFrame {
         p.add(new JScrollPane(usersList), BorderLayout.CENTER);
         return p;
     }
+
+    private JPanel buildSecurityPanel() {
+        JPanel p = new JPanel(new BorderLayout());
+        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        top.add(new JLabel("Estado 2FA: "));
+        top.add(totpStatusLabel);
+        JButton setup = new JButton("Configurar 2FA");
+        setup.addActionListener(e -> doSetupTotp());
+        JButton disable = new JButton("Desactivar 2FA");
+        disable.addActionListener(e -> doDisableTotp());
+        top.add(setup);
+        top.add(disable);
+        p.add(top, BorderLayout.NORTH);
+        return p;
+    }
     // Comentario de lo que hace el metodo refreshFilesList:
     // Este método se encarga de actualizar la lista de archivos disponibles para el usuario.
     // Primero verifica si el usuario está autenticado.
@@ -283,9 +347,11 @@ public final class AuthApp extends JFrame {
         if (currentUsername == null) {
             sessionLabel.setText("No autenticado");
             filesModel.clear();
+            updateSecurityStatus();
             return;
         }
         sessionLabel.setText(currentUsername + (currentRole!=null? " ("+currentRole+")":""));
+        updateSecurityStatus();
         try {
             String[][] files = ServerStore.listFiles(currentUsername, bearerToken);
             filesModel.clear();
@@ -408,6 +474,8 @@ public final class AuthApp extends JFrame {
         if (id == null) { msg("No se pudo resolver el id del fichero"); return; }
         String target = JOptionPane.showInputDialog(this, "Usuario destino:");
         if (target == null || target.isBlank()) return;
+        target = target.trim();
+        if (!isValidUsername(target)) { msg("Usuario destino inválido"); return; }
         try {
             // Obtener el fichero cifrado como owner para recuperar CEK propia
             ServerStore.EncryptedFile ef = ServerStore.downloadFile(currentUsername, id, bearerToken);
@@ -426,6 +494,89 @@ public final class AuthApp extends JFrame {
         } catch (Exception ex) {
             ex.printStackTrace();
             msg("Error compartiendo: " + ex.getMessage());
+        }
+    }
+
+    private void doRevokeSelected() {
+        if (currentUsername == null || currentPrivateKey == null) { msg("Inicia sesión primero"); return; }
+        int idx = filesList.getSelectedIndex();
+        if (idx < 0) { msg("Selecciona un fichero"); return; }
+        String id = idxToId.get(String.valueOf(idx));
+        if (id == null) { msg("No se pudo resolver el id del fichero"); return; }
+        try {
+            String[] recipients = ServerStore.listShareRecipients(currentUsername, id, bearerToken);
+            if (recipients.length == 0) {
+                msg("El fichero no tiene destinatarios activos");
+                return;
+            }
+            String target = (String) JOptionPane.showInputDialog(this, "Revocar usuario:", "Revocar compartición",
+                    JOptionPane.PLAIN_MESSAGE, null, recipients, recipients[0]);
+            if (target == null) return;
+            ServerStore.revokeShare(currentUsername, id, target, bearerToken);
+            msg("Acceso revocado para " + target);
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            msg("Error revocando: " + ex.getMessage());
+        }
+    }
+
+    private void doSetupTotp() {
+        if (currentUsername == null) { msg("Inicia sesión primero"); return; }
+        try {
+            ServerStore.TotpEnrollResponse resp = ServerStore.totpEnroll(bearerToken);
+            String mensaje = "Añade esta cuenta a tu app TOTP."+
+                    "\nSecret: " + resp.secret +
+                    "\nURI: " + resp.otpauthUri +
+                    "\nEscanéalo o introdúcelo manualmente y después confirma con un código de 6 dígitos.";
+            JOptionPane.showMessageDialog(this, mensaje, "Configurar 2FA", JOptionPane.INFORMATION_MESSAGE);
+            while (true) {
+                String code = JOptionPane.showInputDialog(this, "Introduce el código 2FA (6 dígitos):");
+                if (code == null) {
+                    msg("Activación cancelada");
+                    return;
+                }
+                code = code.trim();
+                if (code.isBlank()) continue;
+                try {
+                    ServerStore.totpConfirm(code, bearerToken);
+                    totpEnabled = true;
+                    updateSecurityStatus();
+                    msg("2FA activado correctamente");
+                    return;
+                } catch (IOException io) {
+                    msg("Código incorrecto: " + io.getMessage());
+                }
+            }
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            msg("Error configurando 2FA: " + ex.getMessage());
+        }
+    }
+
+    private void doDisableTotp() {
+        if (currentUsername == null) { msg("Inicia sesión primero"); return; }
+        if (!totpEnabled) {
+            msg("El 2FA ya está deshabilitado");
+            return;
+        }
+        int r = JOptionPane.showConfirmDialog(this, "¿Seguro que deseas desactivar el 2FA?", "Desactivar 2FA", JOptionPane.YES_NO_OPTION);
+        if (r != JOptionPane.YES_OPTION) return;
+        try {
+            ServerStore.totpDisable(bearerToken);
+            totpEnabled = false;
+            updateSecurityStatus();
+            msg("2FA desactivado");
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            msg("Error desactivando 2FA: " + ex.getMessage());
+        }
+    }
+
+    private void updateSecurityStatus() {
+        if (currentUsername == null) {
+            totpStatusLabel.setText("No autenticado");
+        } else {
+            totpStatusLabel.setText(totpEnabled ? "2FA habilitado" : "2FA deshabilitado");
         }
     }
 
