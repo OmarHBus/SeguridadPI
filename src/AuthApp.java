@@ -23,10 +23,12 @@ import java.util.regex.Pattern;            // Username validation pattern
  */
 public final class AuthApp extends JFrame {
 
-    private static final Pattern USERNAME_PATTERN = Pattern.compile("^[a-zA-Z0-9_.-]{3,32}$");
+    private static final Pattern USERNAME_PATTERN = Pattern.compile("^[0-9]{8}[A-Za-z]$");
+    private static final Pattern USERNAME_PATTERN_ALLOW_LEGACY = Pattern.compile("^[a-zA-Z0-9_.-]{3,32}$");
 
     // Campos de registro
     private final JTextField regUser = new JTextField(18);
+    private final JTextField regFullName = new JTextField(18);
     private final JPasswordField regPass = new JPasswordField(18);
 
     // Campos de inicio de sesión
@@ -35,6 +37,7 @@ public final class AuthApp extends JFrame {
 
     // Estado de sesión (útil para futuras funciones: cifrar/descifrar ficheros)
     private String currentUsername = null;
+    private String currentFullName = null;
     private PublicKey currentPublicKey = null;
     private PrivateKey currentPrivateKey = null;
     private String currentRole = null;
@@ -64,16 +67,18 @@ public final class AuthApp extends JFrame {
         c.insets = new Insets(6,6,6,6);
 
         c.gridx=0; c.gridy=0; c.anchor = GridBagConstraints.LINE_END;
-        p.add(new JLabel("Usuario:"), c);
-        c.gridy=1; p.add(new JLabel("Contraseña:"), c);
+        p.add(new JLabel("Usuario (DNI):"), c);
+        c.gridy=1; p.add(new JLabel("Nombre completo:"), c);
+        c.gridy=2; p.add(new JLabel("Contraseña:"), c);
 
         c.gridx=1; c.gridy=0; c.anchor = GridBagConstraints.LINE_START;
         p.add(regUser, c);
-        c.gridy=1; p.add(regPass, c);
+        c.gridy=1; p.add(regFullName, c);
+        c.gridy=2; p.add(regPass, c);
 
         JButton bt = new JButton("Crear cuenta");
         bt.addActionListener(e -> doRegister());
-        c.gridx=1; c.gridy=2; c.anchor = GridBagConstraints.CENTER;
+        c.gridx=1; c.gridy=3; c.anchor = GridBagConstraints.CENTER;
         p.add(bt, c);
         return p;
     }
@@ -102,10 +107,11 @@ public final class AuthApp extends JFrame {
     /** Gestiona el registro: PBKDF2 -> RSA -> envolver privada con AES-GCM -> enviar al servidor. */
     private void doRegister() {
         String u = regUser.getText().trim();
+        String fullName = regFullName.getText().trim();
         char[] p = regPass.getPassword();
 
-        if (u.isEmpty() || p.length==0) { msg("Rellena usuario y contraseña"); wipe(p); return; }
-        if (!isValidUsername(u)) { msg("El usuario debe tener 3-32 caracteres y solo puede contener letras, números, punto, guion y guion bajo"); wipe(p); return; }
+        if (u.isEmpty() || fullName.isEmpty() || p.length==0) { msg("Rellena usuario, nombre y contraseña"); wipe(p); return; }
+        if (!isValidUsernameStrict(u)) { msg("Formato DNI inválido (8 dígitos y una letra)"); wipe(p); return; }
 
         try {
             // 0) Comprobar en servidor si existe
@@ -122,10 +128,11 @@ public final class AuthApp extends JFrame {
 
             // 4) Enviar al servidor (persistencia remota) sin dk
             ServerStore.save(new ServerStore.UserRecord(
-                    u, h.salt, kp.getPublic(), enc.ciphertext, enc.iv
+                    u, fullName, h.salt, kp.getPublic(), enc.ciphertext, enc.iv
             ));
 
             wipe(p);
+            regFullName.setText("");
             msg("Usuario creado en servidor: " + u);
         } catch (Exception ex) {
             wipe(p);
@@ -139,9 +146,10 @@ public final class AuthApp extends JFrame {
         String u = logUser.getText().trim();
         char[] p = logPass.getPassword();
         totpEnabled = false;
+        currentFullName = null;
 
         if (u.isEmpty() || p.length==0) { msg("Rellena usuario y contraseña"); wipe(p); return; }
-        if (!isValidUsername(u)) { msg("El usuario debe tener 3-32 caracteres y solo puede contener letras, números, punto, guion y guion bajo"); wipe(p); return; }
+        if (!isAllowedUsername(u)) { msg("Usuario inválido"); wipe(p); return; }
 
         try {
             // 0) Iniciar auth: obtener nonce. Para claves/salt usa /user (parser ya probado)
@@ -199,6 +207,7 @@ public final class AuthApp extends JFrame {
 
             // Guardar estado
             this.currentUsername = u;
+            this.currentFullName = (finalResult.fullName == null || finalResult.fullName.isBlank()) ? u : finalResult.fullName;
             this.currentPublicKey = pub;
             this.currentPrivateKey = priv;
             this.bearerToken = finalResult.token;
@@ -224,8 +233,12 @@ public final class AuthApp extends JFrame {
         return KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(pkcs8));
     }
 
-    private static boolean isValidUsername(String username) {
+    private static boolean isValidUsernameStrict(String username) {
         return username != null && USERNAME_PATTERN.matcher(username).matches();
+    }
+
+    private static boolean isAllowedUsername(String username) {
+        return username != null && (USERNAME_PATTERN.matcher(username).matches() || USERNAME_PATTERN_ALLOW_LEGACY.matcher(username).matches());
     }
 
     private static String requireField(Map<String, String> json, String key) {
@@ -350,7 +363,8 @@ public final class AuthApp extends JFrame {
             updateSecurityStatus();
             return;
         }
-        sessionLabel.setText(currentUsername + (currentRole!=null? " ("+currentRole+")":""));
+        String displayName = currentFullName == null ? currentUsername : currentFullName;
+        sessionLabel.setText(currentUsername + " - " + displayName + (currentRole!=null? " ("+currentRole+")":""));
         updateSecurityStatus();
         try {
             String[][] files = ServerStore.listFiles(currentUsername, bearerToken);
@@ -377,7 +391,7 @@ public final class AuthApp extends JFrame {
             if ("ADMIN".equalsIgnoreCase(currentRole)) {
                 String[][] users = ServerStore.listAllUsers(bearerToken);
                 for (String[] u : users) {
-                    usersModel.addElement(u[0] + " (" + u[1] + ")");
+                    usersModel.addElement(u[0] + " (" + u[1] + ") - " + u[2]);
                 }
             }
         } catch (Exception ex) {
@@ -475,7 +489,7 @@ public final class AuthApp extends JFrame {
         String target = JOptionPane.showInputDialog(this, "Usuario destino:");
         if (target == null || target.isBlank()) return;
         target = target.trim();
-        if (!isValidUsername(target)) { msg("Usuario destino inválido"); return; }
+        if (!isAllowedUsername(target)) { msg("Usuario destino inválido"); return; }
         try {
             // Obtener el fichero cifrado como owner para recuperar CEK propia
             ServerStore.EncryptedFile ef = ServerStore.downloadFile(currentUsername, id, bearerToken);
@@ -576,7 +590,7 @@ public final class AuthApp extends JFrame {
         if (currentUsername == null) {
             totpStatusLabel.setText("No autenticado");
         } else {
-            totpStatusLabel.setText(totpEnabled ? "2FA habilitado" : "2FA deshabilitado");
+            totpStatusLabel.setText((totpEnabled ? "2FA habilitado" : "2FA deshabilitado") + " · " + (currentFullName == null ? currentUsername : currentFullName));
         }
     }
 

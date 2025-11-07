@@ -50,7 +50,8 @@ public class ServerMain {
     private static final int MAX_GENERIC_BODY = 32_768;                     //MAXIMO DE BYTES PARA EL GENERIC
     private static final int MAX_UPLOAD_BODY = 12_582_912; // ~9.4 MiB decoded -> 12.6 MiB Base64
     private static final int MAX_FILE_DECODED_BYTES = 9_437_184; // Approximately 9 MiB decoded payload per encrypted file
-    private static final Pattern USERNAME_PATTERN = Pattern.compile("^[a-zA-Z0-9_.-]{3,32}$"); //PATTERN DE USUARIO
+    private static final Pattern USERNAME_PATTERN_STRICT = Pattern.compile("^[0-9]{8}[A-Za-z]$");
+    private static final Pattern USERNAME_PATTERN_LEGACY = Pattern.compile("^[a-zA-Z0-9_.-]{3,32}$");
     private static final int MAX_FILENAME_LENGTH = 255;                 //MAXIMO DE LONGITUD DE NOMBRE DE ARCHIVO
     private static final Set<String> ALLOWED_ROLES = Set.of("ADMIN", "USER", "WORKER", "AUDITOR"); //ROLES PERMITIDOS
     private static final long SESSION_TTL_MILLIS = Duration.ofMinutes(20).toMillis();       //TIEMPO DE VIDA DE LA SESSION
@@ -101,12 +102,14 @@ public class ServerMain {
         final long expiresAt;
         final String clientIp;
         final String secret;
-        PendingTotp(String user, String role, long expiresAt, String clientIp, String secret) {
+        final String fullName;
+        PendingTotp(String user, String role, long expiresAt, String clientIp, String secret, String fullName) {
             this.user = user;
             this.role = role;
             this.expiresAt = expiresAt;
             this.clientIp = clientIp;
             this.secret = secret;
+            this.fullName = fullName;
         }
     }
 
@@ -174,6 +177,7 @@ public class ServerMain {
                 // Construcción manual de JSON (simple, sin librerías)
                 String json = "{"+
                         "\"username\":"+JsonUtil.quote(p.getProperty("username"))+","+
+                        "\"fullName\":"+JsonUtil.quote(p.getProperty("fullName", p.getProperty("username","")))+","+
                         "\"saltB64\":"+JsonUtil.quote(p.getProperty("saltB64"))+","+
                         "\"publicKeyB64\":"+JsonUtil.quote(p.getProperty("publicKeyB64"))+","+
                         "\"encPrivateB64\":"+JsonUtil.quote(p.getProperty("encPrivateB64"))+","+
@@ -344,6 +348,7 @@ public class ServerMain {
                         if (!first) sb.append(','); first=false;
                         sb.append('{')
                           .append("\"username\":").append(JsonUtil.quote(p.getProperty("username"))).append(',')
+                          .append("\"fullName\":").append(JsonUtil.quote(p.getProperty("fullName", p.getProperty("username","")))).append(',')
                           .append("\"role\":").append(JsonUtil.quote(p.getProperty("role","USER").toUpperCase()))
                           .append('}');
                     }
@@ -369,7 +374,7 @@ public class ServerMain {
 
                 try {
                     Map<String, String> data = JsonUtil.parseObject(body, 6, 512);
-                    String user = enforceUsername(require(data, "username"));
+                    String user = enforceUsernameStrict(require(data, "username"));
                     String role = enforceRole(require(data, "role"));
                     Path f = ROOT.resolve(user + ".properties");
                     if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
@@ -412,7 +417,7 @@ public class ServerMain {
                 String user;
                 try {
                     Map<String, String> data = JsonUtil.parseObject(body, 4, 256);
-                    user = enforceUsername(require(data, "username"));
+                    user = enforceUsernameAllowLegacy(require(data, "username"));
                 } catch (IllegalArgumentException badInput) {
                     send(exchange, 400, badInput.getMessage());
                     return;
@@ -472,7 +477,7 @@ public class ServerMain {
                 byte[] sig;
                 try {
                     Map<String, String> data = JsonUtil.parseObject(body, 8, 2048);
-                    user = enforceUsername(require(data, "username"));
+                    user = enforceUsernameAllowLegacy(require(data, "username"));
                     nonce = decodeBase64("nonceB64", require(data, "nonceB64"), 16, 128);
                     sig = decodeBase64("signatureB64", require(data, "signatureB64"), 64, 4096);
                 } catch (IllegalArgumentException badInput) {
@@ -524,12 +529,13 @@ public class ServerMain {
                 String secret = p.getProperty("totpSecret");
                 boolean totpEnabled = "true".equalsIgnoreCase(p.getProperty("totpEnabled", "false"))
                         && secret != null && !secret.isBlank();
+                String fullName = p.getProperty("fullName", user);
                 if (totpEnabled) {
                     String ticket = UUID.randomUUID().toString().replace("-", "");
                     long pendingExpires = System.currentTimeMillis() + TOTP_PENDING_TTL_MILLIS;
                     String ip = clientIp(exchange);
                     synchronized (PENDING_TOTP) {
-                        PENDING_TOTP.put(ticket, new PendingTotp(user, role, pendingExpires, ip, secret));
+                        PENDING_TOTP.put(ticket, new PendingTotp(user, role, pendingExpires, ip, secret, fullName));
                     }
                     logAudit("TOTP_REQUIRED", user, exchange, "ticket="+ticket);
                     String out = "{"+
@@ -537,7 +543,8 @@ public class ServerMain {
                             "\"totpRequired\":true,"+
                             "\"ticket\":"+JsonUtil.quote(ticket)+","+
                             "\"role\":"+JsonUtil.quote(role)+","+
-                            "\"username\":"+JsonUtil.quote(user) +""+
+                            "\"username\":"+JsonUtil.quote(user)+","+
+                            "\"fullName\":"+JsonUtil.quote(fullName)+""+
                             "}";
                     sendJson(exchange, 200, out);
                     return;
@@ -558,6 +565,7 @@ public class ServerMain {
                         "\"token\":"+JsonUtil.quote(bearer)+","+
                         "\"role\":"+JsonUtil.quote(role)+","+
                         "\"username\":"+JsonUtil.quote(user)+","+
+                        "\"fullName\":"+JsonUtil.quote(fullName)+","+
                         "\"totpEnabled\":false"+
                         "}";
                 sendJson(exchange, 200, out);
@@ -617,8 +625,9 @@ public class ServerMain {
                 String out = "{"+
                         "\"ok\":true,"+
                         "\"token\":"+JsonUtil.quote(bearer)+","+
-                        "\"role\":"+JsonUtil.quote(pending.role)+","+
-                        "\"username\":"+JsonUtil.quote(pending.user)+","+
+                        "\"role\":"+JsonUtil.quote(pendingFinal.role)+","+
+                        "\"username\":"+JsonUtil.quote(pendingFinal.user)+","+
+                        "\"fullName\":"+JsonUtil.quote(pendingFinal.fullName)+","+
                         "\"totpEnabled\":true"+
                         "}";
                 sendJson(exchange, 200, out);
@@ -709,7 +718,7 @@ public class ServerMain {
 
                 try {
                     Map<String, String> data = JsonUtil.parseObject(body, 8, 2048);
-                    String target = enforceUsername(require(data, "user"));
+                    String target = enforceUsernameAllowLegacy(require(data, "user"));
                     String cekWrapB64 = canonicalBase64("cekWrappedB64", require(data, "cekWrappedB64"), 32, 1024);
                     Properties p = new Properties();
                     try (InputStream is = Files.newInputStream(f)) { p.load(is); }
@@ -784,7 +793,7 @@ public class ServerMain {
                 if (parts.length < 6) { send(exchange, 400, "missing owner/id/user"); return; }
                 String owner = parts[3];
                 String id = parts[4];
-                String target = enforceUsername(parts[5]);
+                String target = enforceUsernameAllowLegacy(parts[5]);
                 if (!"ADMIN".equals(sess.role) && !sess.user.equals(owner)) { send(exchange, 403, "forbidden"); return; }
                 Path f = FILES.resolve(owner).resolve(id+".properties");
                 if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
@@ -916,17 +925,19 @@ public class ServerMain {
                 String body = readBody(exchange, MAX_REGISTER_BODY);
                 Map<String, String> data = JsonUtil.parseObject(body, 12, 2048);
 
-                String user = enforceUsername(require(data, "username"));
+                String user = enforceUsernameStrict(require(data, "username"));
                 String saltB64 = canonicalBase64("saltB64", require(data, "saltB64"), 16, 32);
                 String pubB64 = canonicalBase64("publicKeyB64", require(data, "publicKeyB64"), 256, 4096);
                 String encPriv = canonicalBase64("encPrivateB64", require(data, "encPrivateB64"), 256, 6144);
                 String ivB64 = canonicalBase64("ivB64", require(data, "ivB64"), 12, 48);
+                String fullName = require(data, "fullName");
 
                 Path f = ROOT.resolve(user + ".properties");
                 if (Files.exists(f)) { send(exchange, 409, "user exists"); return; }
 
                 Properties p = new Properties();
                 p.setProperty("username", user);
+                p.setProperty("fullName", fullName);
                 p.setProperty("saltB64", saltB64);
                 p.setProperty("publicKeyB64", pubB64);
                 p.setProperty("encPrivateB64", encPriv);
@@ -1031,13 +1042,23 @@ public class ServerMain {
         return trimmed;
     }
 
-    /** Validates usernames against the server policy. */
-    private static String enforceUsername(String raw) {
+    private static String enforceUsernameStrict(String raw) {
         String candidate = raw.trim();
-        if (!USERNAME_PATTERN.matcher(candidate).matches()) {
+        if (!USERNAME_PATTERN_STRICT.matcher(candidate).matches()) {
             throw new IllegalArgumentException("invalid username");
         }
         return candidate;
+    }
+
+    private static String enforceUsernameAllowLegacy(String raw) {
+        String candidate = raw.trim();
+        if (USERNAME_PATTERN_STRICT.matcher(candidate).matches()) {
+            return candidate;
+        }
+        if (USERNAME_PATTERN_LEGACY.matcher(candidate).matches()) {
+            return candidate;
+        }
+        throw new IllegalArgumentException("invalid username");
     }
 
     /** Ensures filenames remain within allowed characters and length. */

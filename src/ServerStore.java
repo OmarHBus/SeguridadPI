@@ -54,8 +54,9 @@ public final class ServerStore {
         public final String username;
         public final byte[] salt, encPriv, iv;
         public final PublicKey publicKey;
-        public UserRecord(String u, byte[] s, PublicKey pub, byte[] e, byte[] i) {
-            username=u; salt=s; publicKey=pub; encPriv=e; iv=i;
+        public final String fullName;
+        public UserRecord(String u, String fullName, byte[] s, PublicKey pub, byte[] e, byte[] i) {
+            username=u; this.fullName = fullName; salt=s; publicKey=pub; encPriv=e; iv=i;
         }
     }
 
@@ -66,8 +67,9 @@ public final class ServerStore {
         public final String role;
         public final String ticket;
         public final boolean totpEnabled;
-        public AuthResult(boolean ok, boolean totpRequired, String token, String role, String ticket, boolean totpEnabled) {
-            this.ok = ok; this.totpRequired = totpRequired; this.token = token; this.role = role; this.ticket = ticket; this.totpEnabled = totpEnabled;
+        public final String fullName;
+        public AuthResult(boolean ok, boolean totpRequired, String token, String role, String ticket, boolean totpEnabled, String fullName) {
+            this.ok = ok; this.totpRequired = totpRequired; this.token = token; this.role = role; this.ticket = ticket; this.totpEnabled = totpEnabled; this.fullName = fullName;
         }
     }
 
@@ -127,6 +129,7 @@ public final class ServerStore {
 
             Map<String, String> data = JsonUtil.parseObject(json, 16, 4096);
             String u   = require(data, "username");
+            String fullName = data.getOrDefault("fullName", u);
             byte[] salt= b64d(require(data, "saltB64"));
             byte[] pub = b64d(require(data, "publicKeyB64"));
             byte[] enc = b64d(require(data, "encPrivateB64"));
@@ -136,7 +139,7 @@ public final class ServerStore {
             PublicKey pk = KeyFactory.getInstance("RSA").generatePublic(new X509EncodedKeySpec(pub));
             
             // Crear objeto UserRecord con toda la información
-            return Optional.of(new UserRecord(u, salt, pk, enc, iv));
+            return Optional.of(new UserRecord(u, fullName, salt, pk, enc, iv));
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -186,7 +189,8 @@ public final class ServerStore {
         if (totpRequired) {
             String ticket = require(data, "ticket");
             String role = require(data, "role");
-            return new AuthResult(false, true, null, role, ticket, true);
+            String fullName = data.getOrDefault("fullName", username);
+            return new AuthResult(false, true, null, role, ticket, true, fullName);
         }
         if (!ok) {
             throw new IOException("authentication failed");
@@ -194,7 +198,8 @@ public final class ServerStore {
         String token = require(data, "token");
         String role = require(data, "role");
         boolean totpEnabled = Boolean.parseBoolean(data.getOrDefault("totpEnabled", "false"));
-        return new AuthResult(true, false, token, role, null, totpEnabled);
+        String fullName = data.getOrDefault("fullName", username);
+        return new AuthResult(true, false, token, role, null, totpEnabled, fullName);
     }
 
     /** Completa el login introduciendo el código TOTP. */
@@ -220,7 +225,8 @@ public final class ServerStore {
         String token = require(data, "token");
         String role = require(data, "role");
         boolean totpEnabled = Boolean.parseBoolean(data.getOrDefault("totpEnabled", "true"));
-        return new AuthResult(true, false, token, role, null, totpEnabled);
+        String fullName = data.getOrDefault("fullName", "");
+        return new AuthResult(true, false, token, role, null, totpEnabled, fullName);
     }
 
     /**
@@ -233,6 +239,7 @@ public final class ServerStore {
         // Construir JSON con los campos del usuario
         String json = "{"+
                 "\"username\":"+JsonUtil.quote(ur.username)+","+
+                "\"fullName\":"+JsonUtil.quote(ur.fullName)+","+
                 "\"saltB64\":"+JsonUtil.quote(b64(ur.salt))+","+
                 "\"publicKeyB64\":"+JsonUtil.quote(b64(ur.publicKey.getEncoded()))+","+
                 "\"encPrivateB64\":"+JsonUtil.quote(b64(ur.encPriv))+","+
@@ -360,11 +367,12 @@ public final class ServerStore {
         String json = new String(c.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         c.disconnect();
         List<Map<String, String>> items = JsonUtil.parseArrayOfObjects(json, 1024, 4, 512);
-        String[][] result = new String[items.size()][2];
+        String[][] result = new String[items.size()][3];
         for (int i = 0; i < items.size(); i++) {
             Map<String, String> item = items.get(i);
             result[i][0] = require(item, "username");
             result[i][1] = require(item, "role");
+            result[i][2] = item.getOrDefault("fullName", result[i][0]);
         }
         return result;
     }
