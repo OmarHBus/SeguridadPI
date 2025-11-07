@@ -1,23 +1,33 @@
-// === Librerías del servidor HTTP embebido de Java (sin dependencias externas) ===
-import com.sun.net.httpserver.HttpExchange; // Representa una petición/respuesta HTTP
-import com.sun.net.httpserver.HttpHandler;  // Interfaz para manejar endpoints
-import com.sun.net.httpserver.HttpServer;   // Servidor HTTP ligero embebido
-import com.sun.net.httpserver.HttpsConfigurator; // Configurador HTTPS
-import com.sun.net.httpserver.HttpsServer;  // Servidor HTTPS
+// === Embedded HTTP server utilities (no external dependencies) ===
+import com.sun.net.httpserver.HttpExchange; // Represents an HTTP request/response pair
+import com.sun.net.httpserver.HttpHandler;  // Interface used to handle endpoints
+import com.sun.net.httpserver.HttpServer;   // Lightweight embedded HTTP server
+import com.sun.net.httpserver.HttpsConfigurator; // HTTPS configurator helper
+import com.sun.net.httpserver.HttpsServer;  // HTTPS server variant
 
-// === E/S y utilidades de sistema de ficheros ===
-import java.io.*;                           // InputStream/OutputStream, IOException
-import java.net.InetSocketAddress;          // Dirección/puerto para el servidor
-import java.net.URI;                        // Para inspeccionar rutas
-import java.nio.charset.StandardCharsets;   // Codificación UTF-8 estable
-import java.nio.file.*;                     // Paths, Files… para leer/escribir .properties
-import java.util.Properties;                // Formato .properties simple (clave=valor)
-import javax.net.ssl.KeyManagerFactory;     // Gestor de claves para TLS
-import javax.net.ssl.SSLContext;            // Contexto TLS
-import java.security.KeyStore;              // Almacén de claves
-import java.util.UUID;                      // Identificadores únicos para ficheros
-import java.util.HashMap;                   // Sesiones
-import java.util.Map;                       // Mapa
+// === I/O and filesystem helpers ===
+import java.io.*;                           // Streams, readers, writers, IOExceptions
+import java.net.InetSocketAddress;          // Address/port binding
+import java.net.URI;                        // URI inspection helpers
+import java.net.URLEncoder;                 // Codificar parámetros en URIs
+import java.nio.charset.StandardCharsets;   // Stable UTF-8 charset
+import java.nio.file.*;                     // Paths, Files for reading/writing .properties
+import java.util.Properties;                // Simple key=value storage (.properties)
+import javax.net.ssl.KeyManagerFactory;     // TLS keystore manager
+import javax.net.ssl.SSLContext;            // TLS context setup
+import java.security.KeyStore;              // Keystore abstraction
+import java.security.SecureRandom;          // Entropy source for tokens/nonces
+import java.time.Duration;                  // TTL calculations
+import java.time.Instant;                   // Timestamps for audit log
+import java.util.UUID;                      // Unique identifiers for files
+import java.util.Base64;                    // Base64 sanitation helpers
+import java.util.HashMap;                   // Session storage
+import java.util.Map;                       // Generic map
+import java.util.List;                      // JSON array handling
+import java.util.Set;                       // Allowed roles
+import java.util.regex.Pattern;             // Input validation patterns
+import javax.crypto.Mac;                    // Token signing HMAC
+import javax.crypto.spec.SecretKeySpec;     // Key material for Mac
 
 /**
  * Servidor HTTP mínimo para gestionar registros de usuarios.
@@ -33,13 +43,74 @@ public class ServerMain {
     private static final int PORT = 8080;                // Puerto HTTP
     private static final int TLS_PORT = 8443;            // Puerto HTTPS
     private static final Path ROOT = Paths.get("server_users"); // Carpeta de almacenamiento
-    private static final Path FILES = Paths.get("server_files");
+    private static final Path FILES = Paths.get("server_files"); //CARPETA DE ARCHIVOS
+    private static final Path AUDIT_LOG = Paths.get("logs", "security.log"); //LOG DE AUDITORIA
 
-    // Sesiones simples en memoria (MVP): token -> (user, role)
+    private static final int MAX_REGISTER_BODY = 8_192;                     //MAXIMO DE BYTES PARA EL REGISTER
+    private static final int MAX_GENERIC_BODY = 32_768;                     //MAXIMO DE BYTES PARA EL GENERIC
+    private static final int MAX_UPLOAD_BODY = 12_582_912; // ~9.4 MiB decoded -> 12.6 MiB Base64
+    private static final int MAX_FILE_DECODED_BYTES = 9_437_184; // Approximately 9 MiB decoded payload per encrypted file
+    private static final Pattern USERNAME_PATTERN_STRICT = Pattern.compile("^[0-9]{8}[A-Za-z]$");
+    private static final Pattern USERNAME_PATTERN_LEGACY = Pattern.compile("^[a-zA-Z0-9_.-]{3,32}$");
+    private static final int MAX_FILENAME_LENGTH = 255;                 //MAXIMO DE LONGITUD DE NOMBRE DE ARCHIVO
+    private static final Set<String> ALLOWED_ROLES = Set.of("ADMIN", "USER", "WORKER", "AUDITOR"); //ROLES PERMITIDOS
+    private static final long SESSION_TTL_MILLIS = Duration.ofMinutes(20).toMillis();       //TIEMPO DE VIDA DE LA SESSION
+    private static final long FAILED_LOCKOUT_MILLIS = Duration.ofMinutes(5).toMillis();     //TIEMPO DE BLOQUEO DE LA CUENTA
+    private static final long FAILED_WINDOW_MILLIS = Duration.ofMinutes(10).toMillis();     //VENTANA DE TIEMPO PARA EL RATE LIMITING
+    private static final int MAX_FAILED_ATTEMPTS = 5;                                       //MAXIMO DE INTENTOS FALLIDOS
+    private static final int MAX_JSON_LARGE_STRING = 8_388_608;                             //8 MiB para los payloads Base64
+
+    private static final Base64.Decoder B64_DEC = Base64.getDecoder();  //DECODER BASE64
+    private static final Base64.Encoder B64_ENC = Base64.getEncoder();  //ENCODER BASE64
+    private static final SecureRandom RNG = new SecureRandom();          //GENERADOR DE NUMEROS ALEATORIOS
+    private static final byte[] TOKEN_SECRET = initTokenSecret();        //SECRET PARA FIRMAR LOS TOKENS
+    private static final byte[] META_HMAC_SECRET = "P1-META-HMAC-KEY-2025".getBytes(StandardCharsets.UTF_8);
+    private static final Object AUDIT_LOCK = new Object();               //LOCK PARA EL AUDIT LOG
+    private static final int TOTP_SECRET_BYTES = 20;
+    private static final int TOTP_STEP_SECONDS = 30;
+    private static final int TOTP_DIGITS = 6;
+    private static final int TOTP_ALLOWED_DRIFT = 1;
+    private static final long TOTP_PENDING_TTL_MILLIS = Duration.ofMinutes(2).toMillis();
+
+    // In-memory session storage (MVP): token -> (user, role)
     private static final Map<String, Session> SESSIONS = new HashMap<>();
-    private static final class Session {
-        final String user; final String role;
-        Session(String u, String r){ this.user=u; this.role=r; }
+    private static final Map<String, FailedLogin> FAILED_LOGINS = new HashMap<>();    //MAPA DE INTENTOS FALLIDOS
+    private static final Map<String, PendingTotp> PENDING_TOTP = new HashMap<>();
+    private static final class Session {                                        //CLASE DE LA SESSION
+        final String user;                                             //USUARIO
+        final String role;                                             //ROL
+        final long expiresAt;                                          //TIEMPO DE EXPIRACION
+        final String clientIp;                                         //IP DEL CLIENTE
+        final String signature;                                        //FIRMA DEL TOKEN
+        Session(String user, String role, long expiresAt, String clientIp, String signature) {
+            this.user = user;                                        //ASIGNACION DEL USUARIO
+            this.role = role;                                        //ASIGNACION DEL ROL
+            this.expiresAt = expiresAt;                              //ASIGNACION DEL TIEMPO DE EXPIRACION
+            this.clientIp = clientIp;                                //ASIGNACION DE LA IP DEL CLIENTE
+            this.signature = signature;                               //ASIGNACION DE LA FIRMA DEL TOKEN
+        }
+    }
+    private static final class FailedLogin {
+        int attempts;                                                 //INTENTOS FALLIDOS
+        long lastFailure;                                            //ULTIMO FALLO
+        long lockedUntil;
+    }                                                       //TIEMPO DE BLOQUEO
+
+    private static final class PendingTotp {
+        final String user;
+        final String role;
+        final long expiresAt;
+        final String clientIp;
+        final String secret;
+        final String fullName;
+        PendingTotp(String user, String role, long expiresAt, String clientIp, String secret, String fullName) {
+            this.user = user;
+            this.role = role;
+            this.expiresAt = expiresAt;
+            this.clientIp = clientIp;
+            this.secret = secret;
+            this.fullName = fullName;
+        }
     }
 
     /** Starts the embedded HTTP server and registers routes. */
@@ -47,6 +118,9 @@ public class ServerMain {
         // Asegura que la carpeta de usuarios exista
         Files.createDirectories(ROOT);
         Files.createDirectories(FILES);
+        if (AUDIT_LOG.getParent() != null) {
+            Files.createDirectories(AUDIT_LOG.getParent());
+        }
         // Crea HTTP o HTTPS según disponibilidad de keystore PKCS#12
         HttpServer srv;
         Path ksPath = Paths.get("server_keystore.p12");
@@ -89,16 +163,27 @@ public class ServerMain {
                 // Carga del .properties del usuario
                 Properties p = new Properties();
                 try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                try {
+                    boolean resealed = ensureMetaHmac(f, p, "User record");
+                    if (resealed) {
+                        logAudit("INTEGRITY_RESEAL", user, exchange, "user record resealed");
+                    }
+                } catch (IOException integrity) {
+                    logAudit("INTEGRITY_FAIL", user, exchange, integrity.getMessage());
+                    send(exchange, 500, "integrity check failed");
+                    return;
+                }
 
                 // Construcción manual de JSON (simple, sin librerías)
-                String json = "{"
-                        + "\"username\":\""+esc(p.getProperty("username"))+"\","
-                        + "\"saltB64\":\""+p.getProperty("saltB64")+"\","
-                        + "\"publicKeyB64\":\""+p.getProperty("publicKeyB64")+"\","
-                        + "\"encPrivateB64\":\""+p.getProperty("encPrivateB64")+"\","
-                        + "\"ivB64\":\""+p.getProperty("ivB64")+"\","
-                        + "\"role\":\""+esc(p.getProperty("role","USER"))+"\""
-                        + "}";
+                String json = "{"+
+                        "\"username\":"+JsonUtil.quote(p.getProperty("username"))+","+
+                        "\"fullName\":"+JsonUtil.quote(p.getProperty("fullName", p.getProperty("username","")))+","+
+                        "\"saltB64\":"+JsonUtil.quote(p.getProperty("saltB64"))+","+
+                        "\"publicKeyB64\":"+JsonUtil.quote(p.getProperty("publicKeyB64"))+","+
+                        "\"encPrivateB64\":"+JsonUtil.quote(p.getProperty("encPrivateB64"))+","+
+                        "\"ivB64\":"+JsonUtil.quote(p.getProperty("ivB64"))+","+
+                        "\"role\":"+JsonUtil.quote(p.getProperty("role","USER"))
+                        +"}";
                 sendJson(exchange, 200, json);
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
@@ -117,29 +202,41 @@ public class ServerMain {
                 if (user == null) { send(exchange, 400, "missing user"); return; }
                 if (!"ADMIN".equals(sess.role) && !sess.user.equals(user)) { send(exchange, 403, "forbidden"); return; }
 
-                // Esperamos un cuerpo binario con un encabezado JSON mínimo en query?
-                // Para MVP: recibimos cuerpo como JSON texto: {filename, ivB64, cekWrappedB64, ctB64}
-                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-                String filename = jsonGet(body, "filename");
-                String ivB64    = jsonGet(body, "ivB64");
-                String cekWrapB64 = jsonGet(body, "cekWrappedB64");
-                String ctB64    = jsonGet(body, "ctB64");
-                if (filename==null || ivB64==null || cekWrapB64==null || ctB64==null) { send(exchange, 400, "missing fields"); return; }
+                String body;
+                try {
+                    body = readBody(exchange, MAX_UPLOAD_BODY);
+                } catch (IllegalArgumentException tooBig) {
+                    send(exchange, 413, "body too large");
+                    return;
+                }
 
-                String id = UUID.randomUUID().toString().replace("-", "");
-                Path dir = FILES.resolve(user);
-                Files.createDirectories(dir);
+                try {
+                    Map<String, String> data = JsonUtil.parseObject(body, 16, MAX_JSON_LARGE_STRING);
+                    String filename = enforceFilename(require(data, "filename"));
+                    String ivB64 = canonicalBase64("ivB64", require(data, "ivB64"), 12, 48);
+                    String cekWrapB64 = canonicalBase64("cekWrappedB64", require(data, "cekWrappedB64"), 32, 1024);
+                    String ctB64 = canonicalBase64("ctB64", require(data, "ctB64"), 0, MAX_FILE_DECODED_BYTES);
 
-                Properties p = new Properties();
-                p.setProperty("id", id);
-                p.setProperty("owner", user);
-                p.setProperty("filename", filename);
-                p.setProperty("ivB64", ivB64);
-                p.setProperty("cekWrappedB64", cekWrapB64);
-                p.setProperty("ctB64", ctB64);
+                    String id = UUID.randomUUID().toString().replace("-", "");
+                    Path dir = FILES.resolve(user);
+                    Files.createDirectories(dir);
 
-                try (OutputStream os = Files.newOutputStream(dir.resolve(id+".properties"))) { p.store(os, "File record"); }
-                sendJson(exchange, 201, "{\"fileId\":\""+id+"\"}");
+                    Properties p = new Properties();
+                    p.setProperty("id", id);
+                    p.setProperty("owner", user);
+                    p.setProperty("filename", filename);
+                    p.setProperty("ivB64", ivB64);
+                    p.setProperty("cekWrappedB64", cekWrapB64);
+                    p.setProperty("ctB64", ctB64);
+                    p.setProperty("metaHmac", computeMetaHmac(p));
+
+                    try (OutputStream os = Files.newOutputStream(dir.resolve(id+".properties"))) { p.store(os, "File record"); }
+                    logAudit("FILE_UPLOAD", sess.user, exchange, "owner="+user+",id="+id);
+                    sendJson(exchange, 201, "{\"fileId\":"+JsonUtil.quote(id)+"}");
+                } catch (IllegalArgumentException badInput) {
+                    logAudit("FILE_UPLOAD_REJECTED", sess.user, exchange, badInput.getMessage());
+                    send(exchange, 400, badInput.getMessage());
+                }
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
 
@@ -159,11 +256,20 @@ public class ServerMain {
                     for (Path f : ds) {
                         Properties p = new Properties();
                         try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                        try {
+                            boolean resealed = ensureMetaHmac(f, p, "File record");
+                            if (resealed) {
+                                logAudit("INTEGRITY_RESEAL", sess.user, exchange, "file resealed:"+p.getProperty("id"));
+                            }
+                        } catch (IOException integrity) {
+                            logAudit("INTEGRITY_FAIL", sess.user, exchange, integrity.getMessage());
+                            continue;
+                        }
                         if (!first) sb.append(',');
                         first = false;
                         sb.append('{')
-                          .append("\"id\":\"").append(esc(p.getProperty("id"))).append("\",")
-                          .append("\"filename\":\"").append(esc(p.getProperty("filename"))).append("\"")
+                          .append("\"id\":").append(JsonUtil.quote(p.getProperty("id"))).append(',')
+                          .append("\"filename\":").append(JsonUtil.quote(p.getProperty("filename")))
                           .append('}');
                     }
                 }
@@ -191,13 +297,22 @@ public class ServerMain {
                                 for (Path f : ds) {
                                     Properties p = new Properties();
                                     try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                                    try {
+                                        boolean resealed = ensureMetaHmac(f, p, "File record");
+                                        if (resealed) {
+                                            logAudit("INTEGRITY_RESEAL", sess.user, exchange, "file resealed:"+p.getProperty("id"));
+                                        }
+                                    } catch (IOException integrity) {
+                                        logAudit("INTEGRITY_FAIL", sess.user, exchange, integrity.getMessage());
+                                        continue;
+                                    }
                                     String wrap = p.getProperty("wrap."+user);
                                     if (wrap == null) continue;
                                     if (!first) sb.append(','); first = false;
                                     sb.append('{')
-                                      .append("\"owner\":\"").append(esc(owner)).append("\",")
-                                      .append("\"id\":\"").append(esc(p.getProperty("id"))).append("\",")
-                                      .append("\"filename\":\"").append(esc(p.getProperty("filename"))).append("\"")
+                                      .append("\"owner\":").append(JsonUtil.quote(owner)).append(',')
+                                      .append("\"id\":").append(JsonUtil.quote(p.getProperty("id"))).append(',')
+                                      .append("\"filename\":").append(JsonUtil.quote(p.getProperty("filename")))
                                       .append('}');
                                 }
                             }
@@ -221,10 +336,20 @@ public class ServerMain {
                     for (Path f : ds) {
                         Properties p = new Properties();
                         try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                        try {
+                            boolean resealed = ensureMetaHmac(f, p, "User record");
+                            if (resealed) {
+                                logAudit("INTEGRITY_RESEAL", sess.user, exchange, "user record resealed");
+                            }
+                        } catch (IOException integrity) {
+                            logAudit("INTEGRITY_FAIL", sess.user, exchange, integrity.getMessage());
+                            continue;
+                        }
                         if (!first) sb.append(','); first=false;
                         sb.append('{')
-                          .append("\"username\":\"").append(esc(p.getProperty("username"))).append("\",")
-                          .append("\"role\":\"").append(esc(p.getProperty("role","USER").toUpperCase())).append("\"")
+                          .append("\"username\":").append(JsonUtil.quote(p.getProperty("username"))).append(',')
+                          .append("\"fullName\":").append(JsonUtil.quote(p.getProperty("fullName", p.getProperty("username","")))).append(',')
+                          .append("\"role\":").append(JsonUtil.quote(p.getProperty("role","USER").toUpperCase()))
                           .append('}');
                     }
                 }
@@ -238,17 +363,41 @@ public class ServerMain {
                 Session sess = getSession(exchange);
                 if (sess == null || !"ADMIN".equals(sess.role)) { send(exchange, 403, "admin only"); return; }
                 if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
-                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-                String user = jsonGet(body, "username");
-                String role = jsonGet(body, "role");
-                if (user==null || role==null) { send(exchange, 400, "missing fields"); return; }
-                Path f = ROOT.resolve(user + ".properties");
-                if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
-                Properties p = new Properties();
-                try (InputStream is = Files.newInputStream(f)) { p.load(is); }
-                p.setProperty("role", role.toUpperCase());
-                try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
-                send(exchange, 200, "ok");
+
+                String body;
+                try {
+                    body = readBody(exchange, MAX_GENERIC_BODY);
+                } catch (IllegalArgumentException tooBig) {
+                    send(exchange, 413, "body too large");
+                    return;
+                }
+
+                try {
+                    Map<String, String> data = JsonUtil.parseObject(body, 6, 512);
+                    String user = enforceUsernameStrict(require(data, "username"));
+                    String role = enforceRole(require(data, "role"));
+                    Path f = ROOT.resolve(user + ".properties");
+                    if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
+                    Properties p = new Properties();
+                    try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                    try {
+                        boolean resealed = ensureMetaHmac(f, p, "User record");
+                        if (resealed) {
+                            logAudit("INTEGRITY_RESEAL", user, exchange, "user record resealed");
+                        }
+                    } catch (IOException integrity) {
+                        logAudit("INTEGRITY_FAIL", user, exchange, integrity.getMessage());
+                        send(exchange, 500, "integrity check failed");
+                        return;
+                    }
+                    p.setProperty("role", role);
+                    p.setProperty("metaHmac", computeMetaHmac(p));
+                    try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
+                    logAudit("ADMIN_SET_ROLE", sess.user, exchange, user+"->"+role);
+                    send(exchange, 200, "ok");
+                } catch (IllegalArgumentException badInput) {
+                    send(exchange, 400, badInput.getMessage());
+                }
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
 
@@ -256,23 +405,57 @@ public class ServerMain {
         srv.createContext("/auth/start", exchange -> {
             try {
                 if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
-                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-                String user = jsonGet(body, "username");
-                if (user == null) { send(exchange, 400, "missing username"); return; }
+
+                String body;
+                try {
+                    body = readBody(exchange, MAX_GENERIC_BODY);
+                } catch (IllegalArgumentException tooBig) {
+                    send(exchange, 413, "body too large");
+                    return;
+                }
+
+                String user;
+                try {
+                    Map<String, String> data = JsonUtil.parseObject(body, 4, 256);
+                    user = enforceUsernameAllowLegacy(require(data, "username"));
+                } catch (IllegalArgumentException badInput) {
+                    send(exchange, 400, badInput.getMessage());
+                    return;
+                }
+
+                long remaining = lockRemaining(user);
+                if (remaining > 0) {
+                    String msg = "account locked for " + (remaining / 1000) + "s";
+                    logAudit("AUTH_LOCKED", user, exchange, msg);
+                    send(exchange, 423, msg);
+                    return;
+                }
+
                 Path f = ROOT.resolve(user + ".properties");
                 if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
                 Properties p = new Properties();
                 try (InputStream is = Files.newInputStream(f)) { p.load(is); }
-                // Generar nonce aleatorio
-                byte[] nonce = new byte[32]; new java.security.SecureRandom().nextBytes(nonce);
+                try {
+                    boolean resealed = ensureMetaHmac(f, p, "User record");
+                    if (resealed) {
+                        logAudit("INTEGRITY_RESEAL", user, exchange, "user record resealed");
+                    }
+                } catch (IOException integrity) {
+                    logAudit("INTEGRITY_FAIL", user, exchange, integrity.getMessage());
+                    send(exchange, 500, "integrity check failed");
+                    return;
+                }
+                byte[] nonce = new byte[32]; RNG.nextBytes(nonce);
+                String nonceB64 = B64_ENC.encodeToString(nonce);
                 String json = "{"+
-                        "\"nonceB64\":\""+java.util.Base64.getEncoder().encodeToString(nonce)+"\","+
-                        "\"saltB64\":\""+p.getProperty("saltB64")+"\","+
-                        "\"publicKeyB64\":\""+p.getProperty("publicKeyB64")+"\","+
-                        "\"encPrivateB64\":\""+p.getProperty("encPrivateB64")+"\","+
-                        "\"ivB64\":\""+p.getProperty("ivB64")+"\""+
-                        "}";
-                exchange.getResponseHeaders().add("X-Auth-Nonce", java.util.Base64.getEncoder().encodeToString(nonce));
+                        "\"nonceB64\":"+JsonUtil.quote(nonceB64)+","+
+                        "\"saltB64\":"+JsonUtil.quote(p.getProperty("saltB64"))+","+
+                        "\"publicKeyB64\":"+JsonUtil.quote(p.getProperty("publicKeyB64"))+","+
+                        "\"encPrivateB64\":"+JsonUtil.quote(p.getProperty("encPrivateB64"))+","+
+                        "\"ivB64\":"+JsonUtil.quote(p.getProperty("ivB64"))
+                        +"}";
+                exchange.getResponseHeaders().add("X-Auth-Nonce", nonceB64);
+                logAudit("AUTH_CHALLENGE", user, exchange, "nonce");
                 sendJson(exchange, 200, json);
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
@@ -280,32 +463,173 @@ public class ServerMain {
         srv.createContext("/auth/finish", exchange -> {
             try {
                 if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
-                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-                String user = jsonGet(body, "username");
-                String nonceB64 = jsonGet(body, "nonceB64");
-                String sigB64 = jsonGet(body, "signatureB64");
-                if (user==null || nonceB64==null || sigB64==null) { send(exchange, 400, "missing fields"); return; }
+
+                String body;
+                try {
+                    body = readBody(exchange, MAX_GENERIC_BODY);
+                } catch (IllegalArgumentException tooBig) {
+                    send(exchange, 413, "body too large");
+                    return;
+                }
+
+                String user;
+                byte[] nonce;
+                byte[] sig;
+                try {
+                    Map<String, String> data = JsonUtil.parseObject(body, 8, 2048);
+                    user = enforceUsernameAllowLegacy(require(data, "username"));
+                    nonce = decodeBase64("nonceB64", require(data, "nonceB64"), 16, 128);
+                    sig = decodeBase64("signatureB64", require(data, "signatureB64"), 64, 4096);
+                } catch (IllegalArgumentException badInput) {
+                    send(exchange, 400, badInput.getMessage());
+                    return;
+                }
+
+                long lockRemaining = lockRemaining(user);
+                if (lockRemaining > 0) {
+                    String msg = "account locked for " + (lockRemaining / 1000) + "s";
+                    logAudit("AUTH_LOCKED", user, exchange, msg);
+                    send(exchange, 423, msg);
+                    return;
+                }
+
                 Path f = ROOT.resolve(user + ".properties");
                 if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
                 Properties p = new Properties();
                 try (InputStream is = Files.newInputStream(f)) { p.load(is); }
-                byte[] pub = java.util.Base64.getDecoder().decode(p.getProperty("publicKeyB64"));
+                try {
+                    boolean resealed = ensureMetaHmac(f, p, "User record");
+                    if (resealed) {
+                        logAudit("INTEGRITY_RESEAL", user, exchange, "user record resealed");
+                    }
+                } catch (IOException integrity) {
+                    logAudit("INTEGRITY_FAIL", user, exchange, integrity.getMessage());
+                    send(exchange, 500, "integrity check failed");
+                    return;
+                }
+                byte[] pubBytes = decodeBase64("publicKeyB64", p.getProperty("publicKeyB64"), 256, 4096);
                 java.security.PublicKey pk = java.security.KeyFactory.getInstance("RSA")
-                        .generatePublic(new java.security.spec.X509EncodedKeySpec(pub));
-                byte[] nonce = java.util.Base64.getDecoder().decode(nonceB64);
-                byte[] sig = java.util.Base64.getDecoder().decode(sigB64);
+                        .generatePublic(new java.security.spec.X509EncodedKeySpec(pubBytes));
                 java.security.Signature s = java.security.Signature.getInstance("RSASSA-PSS");
                 s.setParameter(new java.security.spec.PSSParameterSpec(
                         "SHA-256", "MGF1", new java.security.spec.MGF1ParameterSpec("SHA-256"), 32, 1));
                 s.initVerify(pk);
                 s.update(nonce);
                 boolean ok = s.verify(sig);
-                if (!ok) { send(exchange, 401, "bad signature"); return; }
+                if (!ok) {
+                    long remaining = registerFailure(user);
+                    String msg = remaining > 0 ? "account locked for " + (remaining / 1000) + "s" : "bad signature";
+                    logAudit("AUTH_FAIL", user, exchange, msg);
+                    send(exchange, remaining > 0 ? 423 : 401, msg);
+                    return;
+                }
+
+                clearFailures(user);
                 String role = p.getProperty("role","USER").toUpperCase();
-                String token = java.util.UUID.randomUUID().toString().replace("-", "");
-                SESSIONS.put(token, new Session(user, role));
+                String secret = p.getProperty("totpSecret");
+                boolean totpEnabled = "true".equalsIgnoreCase(p.getProperty("totpEnabled", "false"))
+                        && secret != null && !secret.isBlank();
+                String fullName = p.getProperty("fullName", user);
+                if (totpEnabled) {
+                    String ticket = UUID.randomUUID().toString().replace("-", "");
+                    long pendingExpires = System.currentTimeMillis() + TOTP_PENDING_TTL_MILLIS;
+                    String ip = clientIp(exchange);
+                    synchronized (PENDING_TOTP) {
+                        PENDING_TOTP.put(ticket, new PendingTotp(user, role, pendingExpires, ip, secret, fullName));
+                    }
+                    logAudit("TOTP_REQUIRED", user, exchange, "ticket="+ticket);
+                    String out = "{"+
+                            "\"ok\":false,"+
+                            "\"totpRequired\":true,"+
+                            "\"ticket\":"+JsonUtil.quote(ticket)+","+
+                            "\"role\":"+JsonUtil.quote(role)+","+
+                            "\"username\":"+JsonUtil.quote(user)+","+
+                            "\"fullName\":"+JsonUtil.quote(fullName)+""+
+                            "}";
+                    sendJson(exchange, 200, out);
+                    return;
+                }
+                long expiresAt = System.currentTimeMillis() + SESSION_TTL_MILLIS;
+                String tokenId = UUID.randomUUID().toString().replace("-", "");
+                String payload = tokenId + "." + expiresAt;
+                String signature = signToken(payload);
+                String bearer = payload + "." + signature;
+                String ip = clientIp(exchange);
+                synchronized (SESSIONS) {
+                    SESSIONS.entrySet().removeIf(e -> e.getValue().user.equals(user));
+                    SESSIONS.put(tokenId, new Session(user, role, expiresAt, ip, signature));
+                }
+                logAudit("AUTH_SUCCESS", user, exchange, "role="+role);
                 String out = "{"+
-                        "\"ok\":true,\"token\":\""+token+"\",\"role\":\""+role+"\",\"username\":\""+esc(user)+"\"}";
+                        "\"ok\":true,"+
+                        "\"token\":"+JsonUtil.quote(bearer)+","+
+                        "\"role\":"+JsonUtil.quote(role)+","+
+                        "\"username\":"+JsonUtil.quote(user)+","+
+                        "\"fullName\":"+JsonUtil.quote(fullName)+","+
+                        "\"totpEnabled\":false"+
+                        "}";
+                sendJson(exchange, 200, out);
+            } catch (Exception e) { send(exchange, 500, e.toString()); }
+        });
+
+        srv.createContext("/auth/totp", exchange -> {
+            try {
+                if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
+                String body;
+                try {
+                    body = readBody(exchange, MAX_GENERIC_BODY);
+                } catch (IllegalArgumentException tooBig) {
+                    send(exchange, 413, "body too large");
+                    return;
+                }
+                Map<String, String> data = JsonUtil.parseObject(body, 6, 256);
+                String ticket = require(data, "ticket");
+                String code = require(data, "code");
+                if (!code.matches("\\d{"+TOTP_DIGITS+"}")) {
+                    send(exchange, 400, "invalid code");
+                    return;
+                }
+                PendingTotp pending;
+                long now = System.currentTimeMillis();
+                synchronized (PENDING_TOTP) {
+                    pending = PENDING_TOTP.get(ticket);
+                    if (pending != null && now > pending.expiresAt) {
+                        PENDING_TOTP.remove(ticket);
+                        pending = null;
+                    }
+                }
+                if (pending == null) { send(exchange, 404, "ticket not found"); return; }
+                String ip = clientIp(exchange);
+                if (!pending.clientIp.equals(ip)) {
+                    logAudit("TOTP_VERIFY_FAIL", pending.user, exchange, "ip mismatch");
+                    send(exchange, 403, "ip mismatch");
+                    return;
+                }
+                if (!verifyTotp(pending.secret, code)) {
+                    logAudit("TOTP_VERIFY_FAIL", pending.user, exchange, "wrong code");
+                    send(exchange, 401, "wrong code");
+                    return;
+                }
+                synchronized (PENDING_TOTP) { PENDING_TOTP.remove(ticket); }
+                long expiresAt = now + SESSION_TTL_MILLIS;
+                String tokenId = UUID.randomUUID().toString().replace("-", "");
+                String payload = tokenId + "." + expiresAt;
+                String signature = signToken(payload);
+                String bearer = payload + "." + signature;
+                final PendingTotp pendingFinal = pending;
+                synchronized (SESSIONS) {
+                    SESSIONS.entrySet().removeIf(e -> e.getValue().user.equals(pendingFinal.user));
+                    SESSIONS.put(tokenId, new Session(pendingFinal.user, pendingFinal.role, expiresAt, ip, signature));
+                }
+                logAudit("TOTP_VERIFY_SUCCESS", pending.user, exchange, "ticket="+ticket);
+                String out = "{"+
+                        "\"ok\":true,"+
+                        "\"token\":"+JsonUtil.quote(bearer)+","+
+                        "\"role\":"+JsonUtil.quote(pendingFinal.role)+","+
+                        "\"username\":"+JsonUtil.quote(pendingFinal.user)+","+
+                        "\"fullName\":"+JsonUtil.quote(pendingFinal.fullName)+","+
+                        "\"totpEnabled\":true"+
+                        "}";
                 sendJson(exchange, 200, out);
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
@@ -340,18 +664,29 @@ public class ServerMain {
 
                 Properties p = new Properties();
                 try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                try {
+                    boolean resealed = ensureMetaHmac(f, p, "File record");
+                    if (resealed) {
+                        logAudit("INTEGRITY_RESEAL", sess.user, exchange, "file resealed:"+p.getProperty("id"));
+                    }
+                } catch (IOException integrity) {
+                    logAudit("INTEGRITY_FAIL", sess.user, exchange, integrity.getMessage());
+                    send(exchange, 500, "integrity check failed");
+                    return;
+                }
                 boolean isOwner = user.equals(sess.user);
                 boolean isRecipient = p.getProperty("wrap."+sess.user) != null;
                 if (!"ADMIN".equals(sess.role) && !(isOwner || isRecipient)) { send(exchange, 403, "forbidden"); return; }
                 String cekWrap = recipient == null ? p.getProperty("cekWrappedB64") : p.getProperty("wrap."+recipient);
                 if (cekWrap == null) cekWrap = p.getProperty("cekWrappedB64");
                 String json = "{"+
-                        "\"id\":\""+esc(p.getProperty("id"))+"\","+
-                        "\"filename\":\""+esc(p.getProperty("filename"))+"\","+
-                        "\"ivB64\":\""+p.getProperty("ivB64")+"\","+
-                        "\"cekWrappedB64\":\""+cekWrap+"\","+
-                        "\"ctB64\":\""+p.getProperty("ctB64")+"\""+
-                        "}";
+                        "\"id\":"+JsonUtil.quote(p.getProperty("id"))+","+
+                        "\"filename\":"+JsonUtil.quote(p.getProperty("filename"))+","+
+                        "\"ivB64\":"+JsonUtil.quote(p.getProperty("ivB64"))+","+
+                        "\"cekWrappedB64\":"+JsonUtil.quote(cekWrap)+","+
+                        "\"ctB64\":"+JsonUtil.quote(p.getProperty("ctB64"))
+                        +"}";
+                logAudit("FILE_DOWNLOAD", sess.user, exchange, "id="+p.getProperty("id"));
                 sendJson(exchange, 200, json);
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
@@ -372,15 +707,193 @@ public class ServerMain {
                 if ("WORKER".equalsIgnoreCase(sess.role) || "AUDITOR".equalsIgnoreCase(sess.role)) { send(exchange, 403, "role cannot share"); return; }
                 Path f = FILES.resolve(owner).resolve(id+".properties");
                 if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
-                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-                String target = jsonGet(body, "user");
-                String cekWrapB64 = jsonGet(body, "cekWrappedB64");
-                if (target==null || cekWrapB64==null) { send(exchange, 400, "missing fields"); return; }
+
+                String body;
+                try {
+                    body = readBody(exchange, MAX_GENERIC_BODY);
+                } catch (IllegalArgumentException tooBig) {
+                    send(exchange, 413, "body too large");
+                    return;
+                }
+
+                try {
+                    Map<String, String> data = JsonUtil.parseObject(body, 8, 2048);
+                    String target = enforceUsernameAllowLegacy(require(data, "user"));
+                    String cekWrapB64 = canonicalBase64("cekWrappedB64", require(data, "cekWrappedB64"), 32, 1024);
+                    Properties p = new Properties();
+                    try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                    try {
+                        boolean resealed = ensureMetaHmac(f, p, "File record");
+                        if (resealed) {
+                            logAudit("INTEGRITY_RESEAL", sess.user, exchange, "file resealed:"+p.getProperty("id"));
+                        }
+                    } catch (IOException integrity) {
+                        logAudit("INTEGRITY_FAIL", sess.user, exchange, integrity.getMessage());
+                        send(exchange, 500, "integrity check failed");
+                        return;
+                    }
+                    p.setProperty("wrap."+target, cekWrapB64);
+                    p.setProperty("metaHmac", computeMetaHmac(p));
+                    try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "File record"); }
+                    logAudit("FILE_SHARE", sess.user, exchange, "owner="+owner+",id="+id+",target="+target);
+                    send(exchange, 200, "shared");
+                } catch (IllegalArgumentException badInput) {
+                    logAudit("FILE_SHARE_REJECTED", sess.user, exchange, badInput.getMessage());
+                    send(exchange, 400, badInput.getMessage());
+                }
+            } catch (Exception e) { send(exchange, 500, e.toString()); }
+        });
+
+        srv.createContext("/share/list", exchange -> {
+            try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
+                if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use GET"); return; }
+                String path = exchange.getRequestURI().getPath();
+                String[] parts = path.split("/");
+                if (parts.length < 5) { send(exchange, 400, "missing owner or id"); return; }
+                String owner = parts[3];
+                String id = parts[4];
+                if (!"ADMIN".equals(sess.role) && !sess.user.equals(owner)) { send(exchange, 403, "forbidden"); return; }
+                Path f = FILES.resolve(owner).resolve(id+".properties");
+                if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
                 Properties p = new Properties();
                 try (InputStream is = Files.newInputStream(f)) { p.load(is); }
-                p.setProperty("wrap."+target, cekWrapB64);
+                try {
+                    boolean resealed = ensureMetaHmac(f, p, "File record");
+                    if (resealed) {
+                        logAudit("INTEGRITY_RESEAL", sess.user, exchange, "file resealed:"+p.getProperty("id"));
+                    }
+                } catch (IOException integrity) {
+                    logAudit("INTEGRITY_FAIL", sess.user, exchange, integrity.getMessage());
+                    send(exchange, 500, "integrity check failed");
+                    return;
+                }
+                StringBuilder sb = new StringBuilder("[");
+                boolean first = true;
+                for (String key : p.stringPropertyNames()) {
+                    if (!key.startsWith("wrap.")) continue;
+                    String target = key.substring("wrap.".length());
+                    if (!first) sb.append(',');
+                    first = false;
+                    sb.append(JsonUtil.quote(target));
+                }
+                sb.append(']');
+                sendJson(exchange, 200, sb.toString());
+            } catch (Exception e) { send(exchange, 500, e.toString()); }
+        });
+
+        srv.createContext("/share/revoke", exchange -> {
+            try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
+                if (!"DELETE".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use DELETE"); return; }
+                String path = exchange.getRequestURI().getPath();
+                String[] parts = path.split("/");
+                if (parts.length < 6) { send(exchange, 400, "missing owner/id/user"); return; }
+                String owner = parts[3];
+                String id = parts[4];
+                String target = enforceUsernameAllowLegacy(parts[5]);
+                if (!"ADMIN".equals(sess.role) && !sess.user.equals(owner)) { send(exchange, 403, "forbidden"); return; }
+                Path f = FILES.resolve(owner).resolve(id+".properties");
+                if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
+                Properties p = new Properties();
+                try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                try {
+                    boolean resealed = ensureMetaHmac(f, p, "File record");
+                    if (resealed) {
+                        logAudit("INTEGRITY_RESEAL", sess.user, exchange, "file resealed:"+p.getProperty("id"));
+                    }
+                } catch (IOException integrity) {
+                    logAudit("INTEGRITY_FAIL", sess.user, exchange, integrity.getMessage());
+                    send(exchange, 500, "integrity check failed");
+                    return;
+                }
+                if (p.remove("wrap."+target) == null) {
+                    send(exchange, 404, "share not found");
+                    return;
+                }
+                p.setProperty("metaHmac", computeMetaHmac(p));
                 try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "File record"); }
-                send(exchange, 200, "shared");
+                logAudit("FILE_SHARE_REVOKE", sess.user, exchange, "owner="+owner+",id="+id+",target="+target);
+                send(exchange, 200, "revoked");
+            } catch (Exception e) { send(exchange, 500, e.toString()); }
+        });
+
+        srv.createContext("/totp/enroll", exchange -> {
+            try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
+                if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
+                Path f = ROOT.resolve(sess.user + ".properties");
+                if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
+                Properties p = new Properties();
+                try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                ensureMetaHmac(f, p, "User record");
+                String secret = generateTotpSecret();
+                p.setProperty("totpSecret", secret);
+                p.setProperty("totpEnabled", "false");
+                p.setProperty("metaHmac", computeMetaHmac(p));
+                try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
+                String uri = "otpauth://totp/" + URLEncoder.encode("P1:" + sess.user, StandardCharsets.UTF_8)
+                        + "?secret=" + secret + "&issuer=" + URLEncoder.encode("P1", StandardCharsets.UTF_8);
+                logAudit("TOTP_ENROLL_START", sess.user, exchange, "");
+                String out = "{"+
+                        "\"secret\":"+JsonUtil.quote(secret)+","+
+                        "\"otpauthUri\":"+JsonUtil.quote(uri)+""+
+                        "}";
+                sendJson(exchange, 200, out);
+            } catch (Exception e) { send(exchange, 500, e.toString()); }
+        });
+
+        srv.createContext("/totp/confirm", exchange -> {
+            try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
+                if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
+                String body = readBody(exchange, MAX_GENERIC_BODY);
+                Map<String, String> data = JsonUtil.parseObject(body, 4, 256);
+                String code = require(data, "code");
+                if (!code.matches("\\d{"+TOTP_DIGITS+"}")) { send(exchange, 400, "invalid code"); return; }
+                Path f = ROOT.resolve(sess.user + ".properties");
+                if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
+                Properties p = new Properties();
+                try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                ensureMetaHmac(f, p, "User record");
+                String secret = p.getProperty("totpSecret");
+                if (secret == null || secret.isBlank()) { send(exchange, 409, "totp not enrolled"); return; }
+                if (!verifyTotp(secret, code)) {
+                    logAudit("TOTP_VERIFY_FAIL", sess.user, exchange, "enroll confirm");
+                    send(exchange, 401, "wrong code");
+                    return;
+                }
+                p.setProperty("totpEnabled", "true");
+                p.setProperty("metaHmac", computeMetaHmac(p));
+                try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
+                logAudit("TOTP_ENROLL_CONFIRMED", sess.user, exchange, "");
+                send(exchange, 200, "ok");
+            } catch (Exception e) { send(exchange, 500, e.toString()); }
+        });
+
+        srv.createContext("/totp/disable", exchange -> {
+            try {
+                Session sess = getSession(exchange);
+                if (sess == null) { send(exchange, 401, "unauthorized"); return; }
+                if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) { send(exchange, 405, "use POST"); return; }
+                Path f = ROOT.resolve(sess.user + ".properties");
+                if (!Files.exists(f)) { send(exchange, 404, "not found"); return; }
+                Properties p = new Properties();
+                try (InputStream is = Files.newInputStream(f)) { p.load(is); }
+                ensureMetaHmac(f, p, "User record");
+                p.remove("totpSecret");
+                p.remove("totpEnabled");
+                p.setProperty("metaHmac", computeMetaHmac(p));
+                try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
+                synchronized (PENDING_TOTP) {
+                    PENDING_TOTP.entrySet().removeIf(e -> e.getValue().user.equals(sess.user));
+                }
+                logAudit("TOTP_DISABLED", sess.user, exchange, "");
+                send(exchange, 200, "disabled");
             } catch (Exception e) { send(exchange, 500, e.toString()); }
         });
         
@@ -404,39 +917,39 @@ public class ServerMain {
     // --- Handler dedicado para /register (POST) ---
     static class RegisterHandler implements HttpHandler {
         @Override public void handle(HttpExchange exchange) throws IOException {
-            // Solo acepta POST
+            // Only accept POST
             if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
                 send(exchange, 405, "use POST"); return;
             }
-            // Lee el cuerpo de la petición (JSON plano UTF-8)
-            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            try {
+                String body = readBody(exchange, MAX_REGISTER_BODY);
+                Map<String, String> data = JsonUtil.parseObject(body, 12, 2048);
 
-            // Extrae campos "clave":"valor" (parser naive)
-            String user = jsonGet(body, "username");
-            String saltB64 = jsonGet(body, "saltB64");
-            String pubB64  = jsonGet(body, "publicKeyB64");
-            String encPriv = jsonGet(body, "encPrivateB64");
-            String ivB64   = jsonGet(body, "ivB64");
+                String user = enforceUsernameStrict(require(data, "username"));
+                String saltB64 = canonicalBase64("saltB64", require(data, "saltB64"), 16, 32);
+                String pubB64 = canonicalBase64("publicKeyB64", require(data, "publicKeyB64"), 256, 4096);
+                String encPriv = canonicalBase64("encPrivateB64", require(data, "encPrivateB64"), 256, 6144);
+                String ivB64 = canonicalBase64("ivB64", require(data, "ivB64"), 12, 48);
+                String fullName = require(data, "fullName");
 
-            // Validación de campos requeridos (ya no se acepta dkB64)
-            if (user==null || saltB64==null || pubB64==null || encPriv==null || ivB64==null) {
-                send(exchange, 400, "missing fields"); return;
+                Path f = ROOT.resolve(user + ".properties");
+                if (Files.exists(f)) { send(exchange, 409, "user exists"); return; }
+
+                Properties p = new Properties();
+                p.setProperty("username", user);
+                p.setProperty("fullName", fullName);
+                p.setProperty("saltB64", saltB64);
+                p.setProperty("publicKeyB64", pubB64);
+                p.setProperty("encPrivateB64", encPriv);
+                p.setProperty("ivB64", ivB64);
+                p.setProperty("metaHmac", computeMetaHmac(p));
+
+                try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
+                logAudit("REGISTER_SUCCESS", user, exchange, "");
+                send(exchange, 201, "created");
+            } catch (IllegalArgumentException e) {
+                send(exchange, 400, e.getMessage());
             }
-
-            // Evita sobreescritura: 409 si ya existe
-            Path f = ROOT.resolve(user + ".properties");
-            if (Files.exists(f)) { send(exchange, 409, "user exists"); return; }
-
-            // Guarda el registro como .properties
-            Properties p = new Properties();
-            p.setProperty("username", user);
-            p.setProperty("saltB64", saltB64);
-            p.setProperty("publicKeyB64", pubB64);
-            p.setProperty("encPrivateB64", encPriv);
-            p.setProperty("ivB64", ivB64);
-
-            try (OutputStream os = Files.newOutputStream(f)) { p.store(os, "User record"); }
-            send(exchange, 201, "created");
         }
     }
 
@@ -449,7 +962,7 @@ public class ServerMain {
         return (i>=0 && i+1<p.length()) ? p.substring(i+1) : null;
     }
 
-    /** Respuesta de texto plano con código HTTP */
+    /** Sends plain text responses with the desired HTTP status code. */
     private static void send(HttpExchange ex, int code, String txt) throws IOException {
         byte[] out = txt.getBytes(StandardCharsets.UTF_8);
         ex.getResponseHeaders().add("Content-Type","text/plain; charset=utf-8");
@@ -457,7 +970,7 @@ public class ServerMain {
         try (OutputStream os = ex.getResponseBody()) { os.write(out); }
     }
 
-    /** Respuesta JSON con código HTTP */
+    /** Sends JSON responses with the desired HTTP status code. */
     private static void sendJson(HttpExchange ex, int code, String json) throws IOException {
         byte[] out = json.getBytes(StandardCharsets.UTF_8);
         ex.getResponseHeaders().add("Content-Type","application/json; charset=utf-8");
@@ -465,28 +978,360 @@ public class ServerMain {
         try (OutputStream os = ex.getResponseBody()) { os.write(out); }
     }
 
-    /** Escapa comillas para embutir valores en JSON manual */
-    private static String esc(String s){ return s==null? "": s.replace("\"","\\\""); }
-
-    /** Obtiene la sesión a partir del header Authorization: Bearer <token> */
+    /** Resolves the bearer token from the Authorization header. */
     private static Session getSession(HttpExchange ex) {
         String h = ex.getRequestHeaders().getFirst("Authorization");
         if (h == null || !h.startsWith("Bearer ")) return null;
-        String tok = h.substring(7);
-        return SESSIONS.get(tok);
+        String token = h.substring(7).trim();
+        String[] parts = token.split("\\.");
+        if (parts.length != 3) return null;
+        long expiresAt;
+        try {
+            expiresAt = Long.parseLong(parts[1]);
+        } catch (NumberFormatException exNumber) {
+            return null;
+        }
+        String payload = parts[0] + "." + parts[1];
+        String expectedSig = signToken(payload);
+        if (!constantTimeEquals(expectedSig, parts[2])) {
+            return null;
+        }
+        synchronized (SESSIONS) {
+            Session sess = SESSIONS.get(parts[0]);
+            if (sess == null) return null;
+            long now = System.currentTimeMillis();
+            if (now > sess.expiresAt || sess.expiresAt != expiresAt || !constantTimeEquals(sess.signature, parts[2])) {
+                SESSIONS.remove(parts[0]);
+                return null;
+            }
+            String ip = clientIp(ex);
+            if (sess.clientIp != null && !sess.clientIp.equals(ip)) {
+                return null;
+            }
+            return sess;
+        }
     }
 
-    /**
-     * Parser JSON muy sencillo: busca "key":"value" y extrae el valor.
-     * (Válido para esta práctica; no soporta anidados ni arrays)
-     */
-    private static String jsonGet(String json, String key) {
-        String pat = "\"" + key + "\":\"";
-        int i = json.indexOf(pat);
-        if (i<0) return null;
-        int start = i + pat.length();
-        int end = json.indexOf('"', start);
-        if (end<0) return null;
-        return json.substring(start, end);
+    /** Reads the request body enforcing an upper bound in bytes. */
+    private static String readBody(HttpExchange exchange, int maxBytes) throws IOException {
+        try (InputStream in = exchange.getRequestBody(); ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+            byte[] buf = new byte[4096];
+            int total = 0;
+            int read;
+            while ((read = in.read(buf)) != -1) {
+                total += read;
+                if (total > maxBytes) {
+                    throw new IllegalArgumentException("body too large");
+                }
+                baos.write(buf, 0, read);
+            }
+            return new String(baos.toByteArray(), StandardCharsets.UTF_8);
+        }
+    }
+
+    /** Returns a trimmed field from the parsed JSON map or fails fast. */
+    private static String require(Map<String, String> data, String key) {
+        String value = data.get(key);
+        if (value == null) {
+            throw new IllegalArgumentException("missing field: " + key);
+        }
+        String trimmed = value.trim();
+        if (trimmed.isEmpty()) {
+            throw new IllegalArgumentException("empty field: " + key);
+        }
+        return trimmed;
+    }
+
+    private static String enforceUsernameStrict(String raw) {
+        String candidate = raw.trim();
+        if (!USERNAME_PATTERN_STRICT.matcher(candidate).matches()) {
+            throw new IllegalArgumentException("invalid username");
+        }
+        return candidate;
+    }
+
+    private static String enforceUsernameAllowLegacy(String raw) {
+        String candidate = raw.trim();
+        if (USERNAME_PATTERN_STRICT.matcher(candidate).matches()) {
+            return candidate;
+        }
+        if (USERNAME_PATTERN_LEGACY.matcher(candidate).matches()) {
+            return candidate;
+        }
+        throw new IllegalArgumentException("invalid username");
+    }
+
+    /** Ensures filenames remain within allowed characters and length. */
+    private static String enforceFilename(String raw) {
+        String name = raw.trim();
+        if (name.isEmpty()) {
+            throw new IllegalArgumentException("invalid filename");
+        }
+        if (name.length() > MAX_FILENAME_LENGTH) {
+            throw new IllegalArgumentException("filename too long");
+        }
+        if (name.contains("/") || name.contains("\\") || name.contains("..")) {
+            throw new IllegalArgumentException("invalid filename");
+        }
+        for (int i = 0; i < name.length(); i++) {
+            char ch = name.charAt(i);
+            if (ch < 0x20) {
+                throw new IllegalArgumentException("invalid filename");
+            }
+        }
+        return name;
+    }
+
+    /** Canonicalises a Base64 field after validating its decoded size. */
+    private static String canonicalBase64(String field, String value, int minBytes, int maxBytes) {
+        byte[] decoded = decodeBase64(field, value, minBytes, maxBytes);
+        return B64_ENC.encodeToString(decoded);
+    }
+
+    /** Decodes Base64 data enforcing size constraints. */
+    private static byte[] decodeBase64(String field, String value, int minBytes, int maxBytes) {
+        String sanitized = value.trim();
+        if (sanitized.isEmpty() && minBytes > 0) {
+            throw new IllegalArgumentException("missing field: " + field);
+        }
+        try {
+            byte[] out = B64_DEC.decode(sanitized);
+            if (out.length < minBytes) {
+                throw new IllegalArgumentException(field + " too short");
+            }
+            if (out.length > maxBytes) {
+                throw new IllegalArgumentException(field + " too large");
+            }
+            return out;
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("invalid base64: " + field);
+        }
+    }
+
+    /** Normalises and validates roles allowed in the system. */
+    private static String enforceRole(String raw) {
+        String role = raw.trim().toUpperCase();
+        if (!ALLOWED_ROLES.contains(role)) {
+            throw new IllegalArgumentException("invalid role");
+        }
+        return role;
+    }
+
+    private static byte[] initTokenSecret() {
+        byte[] secret = new byte[32];
+        RNG.nextBytes(secret);
+        return secret;
+    }
+
+    private static String computeMetaHmac(Properties props) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(META_HMAC_SECRET, "HmacSHA256"));
+            String[] keys = props.stringPropertyNames().stream()
+                    .filter(k -> !"metaHmac".equals(k))
+                    .sorted()
+                    .toArray(String[]::new);
+            for (String key : keys) {
+                mac.update(key.getBytes(StandardCharsets.UTF_8));
+                mac.update((byte) '=');
+                mac.update(props.getProperty(key, "").getBytes(StandardCharsets.UTF_8));
+                mac.update((byte) '\n');
+            }
+            return B64_ENC.encodeToString(mac.doFinal());
+        } catch (Exception e) {
+            throw new IllegalStateException("unable to compute meta hmac", e);
+        }
+    }
+
+    private static boolean ensureMetaHmac(Path path, Properties props, String comment) throws IOException {
+        String stored = props.getProperty("metaHmac");
+        String computed = computeMetaHmac(props);
+        if (stored == null || !constantTimeEquals(stored, computed)) {
+            props.setProperty("metaHmac", computed);
+            try (OutputStream os = Files.newOutputStream(path)) { props.store(os, comment); }
+            return stored != null;
+        }
+        return false;
+    }
+
+    private static String signToken(String payload) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(TOKEN_SECRET, "HmacSHA256"));
+            return B64_ENC.encodeToString(mac.doFinal(payload.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            throw new IllegalStateException("unable to sign token", e);
+        }
+    }
+
+    private static boolean constantTimeEquals(String a, String b) {
+        if (a == null || b == null) return false;
+        byte[] x = a.getBytes(StandardCharsets.UTF_8);
+        byte[] y = b.getBytes(StandardCharsets.UTF_8);
+        if (x.length != y.length) return false;
+        int diff = 0;
+        for (int i = 0; i < x.length; i++) {
+            diff |= x[i] ^ y[i];
+        }
+        return diff == 0;
+    }
+
+    private static String generateTotpSecret() {
+        byte[] secret = new byte[TOTP_SECRET_BYTES];
+        RNG.nextBytes(secret);
+        return base32Encode(secret);
+    }
+
+    private static boolean verifyTotp(String secretB32, String code) {
+        try {
+            byte[] key = base32Decode(secretB32);
+            long now = System.currentTimeMillis() / 1000L;
+            long timestep = now / TOTP_STEP_SECONDS;
+            for (int i = -TOTP_ALLOWED_DRIFT; i <= TOTP_ALLOWED_DRIFT; i++) {
+                String expected = formatTotp(totpCode(key, timestep + i));
+                if (expected.equals(code)) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {
+            return false;
+        }
+        return false;
+    }
+
+    private static String formatTotp(int value) {
+        String s = Integer.toString(value);
+        while (s.length() < TOTP_DIGITS) s = "0" + s;
+        return s;
+    }
+
+    private static int totpCode(byte[] key, long counter) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA1");
+        mac.init(new SecretKeySpec(key, "HmacSHA1"));
+        byte[] counterBytes = new byte[8];
+        for (int i = 7; i >= 0; i--) {
+            counterBytes[i] = (byte) (counter & 0xFF);
+            counter >>= 8;
+        }
+        byte[] hash = mac.doFinal(counterBytes);
+        int offset = hash[hash.length - 1] & 0xF;
+        int binary = ((hash[offset] & 0x7F) << 24)
+                | ((hash[offset + 1] & 0xFF) << 16)
+                | ((hash[offset + 2] & 0xFF) << 8)
+                | (hash[offset + 3] & 0xFF);
+        int mod = (int) Math.pow(10, TOTP_DIGITS);
+        return binary % mod;
+    }
+
+    private static final char[] BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".toCharArray();
+
+    private static String base32Encode(byte[] data) {
+        StringBuilder sb = new StringBuilder((data.length * 8 + 4) / 5);
+        int buffer = 0;
+        int bitsLeft = 0;
+        for (byte b : data) {
+            buffer = (buffer << 8) | (b & 0xFF);
+            bitsLeft += 8;
+            while (bitsLeft >= 5) {
+                int index = (buffer >> (bitsLeft - 5)) & 0x1F;
+                bitsLeft -= 5;
+                sb.append(BASE32_ALPHABET[index]);
+            }
+        }
+        if (bitsLeft > 0) {
+            sb.append(BASE32_ALPHABET[(buffer << (5 - bitsLeft)) & 0x1F]);
+        }
+        return sb.toString();
+    }
+
+    private static byte[] base32Decode(String s) {
+        int buffer = 0;
+        int bitsLeft = 0;
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        for (char ch : s.toUpperCase().toCharArray()) {
+            int val;
+            if (ch >= 'A' && ch <= 'Z') {
+                val = ch - 'A';
+            } else if (ch >= '2' && ch <= '7') {
+                val = ch - '2' + 26;
+            } else if (ch == '=' || ch == ' ') {
+                continue;
+            } else {
+                throw new IllegalArgumentException("invalid base32");
+            }
+            buffer = (buffer << 5) | val;
+            bitsLeft += 5;
+            if (bitsLeft >= 8) {
+                baos.write((buffer >> (bitsLeft - 8)) & 0xFF);
+                bitsLeft -= 8;
+            }
+        }
+        return baos.toByteArray();
+    }
+
+    private static String clientIp(HttpExchange ex) {
+        InetSocketAddress remote = ex.getRemoteAddress();
+        if (remote == null) return "unknown";
+        if (remote.getAddress() != null) {
+            return remote.getAddress().getHostAddress();
+        }
+        return remote.toString();
+    }
+
+    private static long lockRemaining(String user) {
+        long now = System.currentTimeMillis();
+        synchronized (FAILED_LOGINS) {
+            FailedLogin fl = FAILED_LOGINS.get(user);
+            if (fl == null) return 0;
+            if (fl.lockedUntil <= now) {
+                fl.lockedUntil = 0;
+                fl.attempts = 0;
+                return 0;
+            }
+            return fl.lockedUntil - now;
+        }
+    }
+
+    private static long registerFailure(String user) {
+        long now = System.currentTimeMillis();
+        synchronized (FAILED_LOGINS) {
+            FailedLogin fl = FAILED_LOGINS.computeIfAbsent(user, k -> new FailedLogin());
+            if (fl.lockedUntil > now) {
+                return fl.lockedUntil - now;
+            }
+            if (now - fl.lastFailure > FAILED_WINDOW_MILLIS) {
+                fl.attempts = 0;
+            }
+            fl.attempts++;
+            fl.lastFailure = now;
+            if (fl.attempts >= MAX_FAILED_ATTEMPTS) {
+                fl.lockedUntil = now + FAILED_LOCKOUT_MILLIS;
+                fl.attempts = 0;
+                return fl.lockedUntil - now;
+            }
+            return 0;
+        }
+    }
+
+    private static void clearFailures(String user) {
+        synchronized (FAILED_LOGINS) {
+            FAILED_LOGINS.remove(user);
+        }
+    }
+
+    private static void logAudit(String action, String user, HttpExchange ex, String detail) {
+        String line = String.format("%s\t%s\t%s\t%s\t%s%n",
+                Instant.now().toString(),
+                clientIp(ex),
+                action,
+                user == null ? "-" : user,
+                detail == null || detail.isBlank() ? "-" : detail.replace('\n', ' ').replace('\r', ' '));
+        try {
+            synchronized (AUDIT_LOCK) {
+                Files.writeString(AUDIT_LOG, line, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            }
+        } catch (IOException ioe) {
+            System.err.println("[audit] " + ioe.getMessage());
+        }
     }
 }
